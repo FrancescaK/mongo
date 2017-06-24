@@ -20,280 +20,239 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #pragma once
 
-#include "../pch.h"
-#include "security.h"
-#include "namespace-inl.h"
-#include "lasterror.h"
-#include "stats/top.h"
-#include "../db/client_common.h"
-#include "../util/concurrency/threadlocal.h"
-#include "../util/net/message_port.h"
-#include "../util/concurrency/rwlock.h"
-#include "d_concurrency.h"
+#include <boost/optional.hpp>
+
+#include "mongo/base/disallow_copying.h"
+#include "mongo/db/client.h"
+#include "mongo/db/logical_session_id.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/random.h"
+#include "mongo/platform/unordered_set.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/transport/session.h"
+#include "mongo/util/concurrency/spin_lock.h"
+#include "mongo/util/concurrency/threadlocal.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/net/abstract_message_port.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
-    extern class ReplSet *theReplSet;
-    class AuthenticationInfo;
-    class Database;
-    class CurOp;
-    class Command;
-    class Client;
-    class AbstractMessagingPort;
-    class LockCollectionForReading;
-    class PageFaultRetryableSection;
+class AbstractMessagingPort;
+class Collection;
+class OperationContext;
 
-#if defined(CLC)
-    typedef LockCollectionForReading _LockCollectionForReading;
-#else
-    typedef readlock _LockCollectionForReading;
-#endif
+typedef long long ConnectionId;
 
-    TSP_DECLARE(Client, currentClient)
+/**
+ * The database's concept of an outside "client".
+ * */
+class Client final : public Decorable<Client> {
+public:
+    /**
+     * Creates a Client object and stores it in TLS for the current thread.
+     *
+     * An unowned pointer to a transport::Session may optionally be provided. If 'session'
+     * is non-null, then it will be used to augment the thread name, and for reporting purposes.
+     *
+     * If provided, session's ref count will be bumped by this Client.
+     */
+    static void initThread(StringData desc, transport::SessionHandle session = nullptr);
+    static void initThread(StringData desc,
+                           ServiceContext* serviceContext,
+                           transport::SessionHandle session);
 
-    typedef long long ConnectionId;
+    /**
+     * Moves client into the thread_local for this thread. After this call, Client::getCurrent
+     * and cc() will return client.get(). The client will be destroyed with the thread exits
+     * or Client::destroy() is called.
+     */
+    static void setCurrent(ServiceContext::UniqueClient client);
 
-    /** the database's concept of an outside "client" */
-    class Client : public ClientBasic {
-        static Client *syncThread;
-    public:
-        // always be in clientsMutex when manipulating this. killop stuff uses these.
-        static set<Client*> clients;      
-        static mongo::mutex clientsMutex; 
-        static int getActiveClientCount( int& writers , int& readers );
-        class Context;
-        ~Client();
-        static int recommendedYieldMicros( int * writers = 0 , int * readers = 0 );
+    /**
+     * Releases the client being managed by the thread_local for this thread. After this call
+     * cc() will crash the server and Client::getCurrent() will return nullptr until either
+     * Client::initThread() or Client::setCurrent() is called.
+     *
+     * The client will be released to the caller.
+     */
+    static ServiceContext::UniqueClient releaseCurrent();
 
-        /** each thread which does db operations has a Client object in TLS.
-         *  call this when your thread starts.
-        */
-        static Client& initThread(const char *desc, AbstractMessagingPort *mp = 0);
+    static Client* getCurrent();
 
-        static void initThreadIfNotAlready(const char *desc) { 
-            if( currentClient.get() )
-                return;
-            initThread(desc);
+    bool getIsLocalHostConnection() {
+        if (!hasRemote()) {
+            return false;
         }
-
-        /** this has to be called as the client goes away, but before thread termination
-         *  @return true if anything was done
-         */
-        bool shutdown();
-
-        /** set so isSyncThread() works */
-        void iAmSyncThread() {
-            wassert( syncThread == 0 );
-            syncThread = this;
-        }
-        /** @return true if this client is the replication secondary pull thread.  not used much, is used in create index sync code. */
-        bool isSyncThread() const { return this == syncThread; }
-
-        string clientAddress(bool includePort=false) const;
-        const AuthenticationInfo * getAuthenticationInfo() const { return &_ai; }
-        AuthenticationInfo * getAuthenticationInfo() { return &_ai; }
-        bool isAdmin() { return _ai.isAuthorized( "admin" ); }
-        CurOp* curop() const { return _curOp; }
-        Context* getContext() const { return _context; }
-        Database* database() const {  return _context ? _context->db() : 0; }
-        const char *ns() const { return _context->ns(); }
-        const char *desc() const { return _desc; }
-        void setLastOp( OpTime op ) { _lastOp = op; }
-        OpTime getLastOp() const { return _lastOp; }
-
-        /** caution -- use Context class instead */
-        void setContext(Context *c) { _context = c; }
-
-        /* report what the last operation was.  used by getlasterror */
-        void appendLastOp( BSONObjBuilder& b ) const;
-
-        bool isGod() const { return _god; } /* this is for map/reduce writes */
-        string toString() const;
-        void gotHandshake( const BSONObj& o );
-        bool hasRemote() const { return _mp; }
-        HostAndPort getRemote() const { assert( _mp ); return _mp->remote(); }
-        BSONObj getRemoteID() const { return _remoteId; }
-        BSONObj getHandshake() const { return _handshake; }
-        AbstractMessagingPort * port() const { return _mp; }
-        ConnectionId getConnectionId() const { return _connectionId; }
-
-        bool inPageFaultRetryableSection() const { return _pageFaultRetryableSection != 0; }
-        PageFaultRetryableSection* getPageFaultRetryableSection() const { return _pageFaultRetryableSection; }
-        
-        bool hasWrittenThisPass() const { return _hasWrittenThisPass; }
-        void writeHappened() { _hasWrittenThisPass = true; }
-        
-        bool allowedToThrowPageFaultException() const;
-
-    private:
-        Client(const char *desc, AbstractMessagingPort *p = 0);
-        friend class CurOp;
-        ConnectionId _connectionId; // > 0 for things "conn", 0 otherwise
-        string _threadId; // "" on non support systems
-        CurOp * _curOp;
-        Context * _context;
-        bool _shutdown; // to track if Client::shutdown() gets called
-        const char * const _desc;
-        bool _god;
-        AuthenticationInfo _ai;
-        OpTime _lastOp;
-        BSONObj _handshake;
-        BSONObj _remoteId;
-        AbstractMessagingPort * const _mp;
-        unsigned _sometimes;
-
-        bool _hasWrittenThisPass;
-        PageFaultRetryableSection *_pageFaultRetryableSection;
-        
-        friend class PageFaultRetryableSection; // TEMP
-    public:
-
-        /** the concept here is the same as MONGO_SOMETIMES.  however that 
-            macro uses a static that will be shared by all threads, and each 
-            time incremented it might eject that line from the other cpu caches (?),
-            so idea is that this is better.
-            */
-        bool sometimes(unsigned howOften) { return ++_sometimes % howOften == 0; }
-
-        /* set _god=true temporarily, safely */
-        class GodScope {
-            bool _prev;
-        public:
-            GodScope();
-            ~GodScope();
-        };
-
-        //static void assureDatabaseIsOpen(const string& ns, string path=dbpath);
-
-        /** "read lock, and set my context, all in one operation" 
-         *  This handles (if not recursively locked) opening an unopened database.
-         */
-        class ReadContext : boost::noncopyable { 
-        public:
-            ReadContext(const string& ns, string path=dbpath, bool doauth=true );
-            Context& ctx() { return *c.get(); }
-        private:
-            scoped_ptr<_LockCollectionForReading> lk;
-            scoped_ptr<Context> c;
-        };
-
-        /* Set database we want to use, then, restores when we finish (are out of scope)
-           Note this is also helpful if an exception happens as the state if fixed up.
-        */
-        class Context : boost::noncopyable {
-        public:
-            /** this is probably what you want */
-            Context(const string& ns, string path=dbpath, bool doauth=true, bool doVersion=true );
-
-            /** note: this does not call finishInit -- i.e., does not call 
-                      shardVersionOk() for example. 
-                see also: reset().
-            */
-            Context( string ns , Database * db, bool doauth=true );
-
-            // used by ReadContext
-            Context(const string& path, const string& ns, Database *db, bool doauth);
-
-            ~Context();
-            Client* getClient() const { return _client; }
-            Database* db() const { return _db; }
-            const char * ns() const { return _ns.c_str(); }
-            bool equals( const string& ns , const string& path=dbpath ) const { return _ns == ns && _path == path; }
-
-            /** @return if the db was created by this Context */
-            bool justCreated() const { return _justCreated; }
-
-            /** @return true iff the current Context is using db/path */
-            bool inDB( const string& db , const string& path=dbpath ) const;
-
-            void _clear() { // this is sort of an "early destruct" indication, _ns can never be uncleared
-                const_cast<string&>(_ns).empty();
-                _db = 0;
-            }
-
-            /** call before unlocking, so clear any non-thread safe state
-             *  _db gets restored on the relock
-             */
-            void unlocked() { _db = 0; }
-
-            /** call after going back into the lock, will re-establish non-thread safe stuff */
-            void relocked() { _finishInit(); }
-
-        private:
-            friend class CurOp;
-            void _finishInit( bool doauth=true);
-            void _auth( int lockState );
-            void checkNotStale() const;
-            void checkNsAccess( bool doauth, int lockState = d.dbMutex.getState() );
-            Client * const _client;
-            Context * const _oldContext;
-            const string _path;
-            bool _justCreated;
-            bool _doVersion;
-            const string _ns;
-            Database * _db;
-        }; // class Client::Context
-
-        struct LockStatus {
-            LockStatus();
-            string whichCollection;
-            unsigned excluder, global, collection;
-            string toString() const;
-        } lockStatus;
-
-#if defined(CLC)
-        void checkLocks() const;
-#else
-        void checkLocks() const { }
-#endif
-
-    }; // class Client
-
-    /** get the Client object for this thread. */
-    inline Client& cc() {
-        Client * c = currentClient.get();
-        assert( c );
-        return *c;
+        return getRemote().isLocalHost();
     }
 
-    inline Client::GodScope::GodScope() {
-        _prev = cc()._god;
-        cc()._god = true;
+    bool hasRemote() const {
+        return (_session != nullptr);
     }
-    inline Client::GodScope::~GodScope() { cc()._god = _prev; }
 
-    /* this unreadlocks and then writelocks; i.e. it does NOT upgrade inside the
-       lock (and is thus wrong to use if you need that, which is usually).
-       that said we use it today for a specific case where the usage is correct.
-    */
-#if 0
-    inline void mongolock::releaseAndWriteLock() {
-        if( !_writelock ) {
-
-#if BOOST_VERSION >= 103500
-            int s = d.dbMutex.getState();
-            if( s != -1 ) {
-                log() << "error: releaseAndWriteLock() s == " << s << endl;
-                msgasserted( 12600, "releaseAndWriteLock: unlock_shared failed, probably recursive" );
-            }
-#endif
-
-            _writelock = true;
-            d.dbMutex.unlock_shared();
-            d.dbMutex.lock();
-
-            // todo: unlocked() method says to call it before unlocking, not after.  so fix this here,
-            // or fix the doc there.
-            if ( cc().getContext() )
-                cc().getContext()->unlocked();
-        }
+    HostAndPort getRemote() const {
+        verify(_session);
+        return _session->remote();
     }
-#endif
 
-    inline bool haveClient() { return currentClient.get() > 0; }
+    /**
+     * Returns the ServiceContext that owns this client session context.
+     */
+    ServiceContext* getServiceContext() const {
+        return _serviceContext;
+    }
 
+    /**
+     * Returns the Session to which this client is bound, if any.
+     */
+    const transport::SessionHandle& session() const& {
+        return _session;
+    }
+
+    transport::SessionHandle session() && {
+        return std::move(_session);
+    }
+
+    /**
+     * Inits a thread if that thread has not already been init'd, setting the thread name to
+     * "desc".
+     */
+    static void initThreadIfNotAlready(StringData desc);
+
+    /**
+     * Inits a thread if that thread has not already been init'd, using the existing thread name
+     */
+    static void initThreadIfNotAlready();
+
+    /**
+     * Destroys the Client object stored in TLS for the current thread. The current thread must have
+     * a Client.
+     *
+     * If destroy() is not called explicitly, then the Client stored in TLS will be destroyed upon
+     * exit of the current thread.
+     */
+    static void destroy();
+
+    std::string clientAddress(bool includePort = false) const;
+    const std::string& desc() const {
+        return _desc;
+    }
+
+    void reportState(BSONObjBuilder& builder);
+
+    // Ensures stability of the client's OperationContext. When the client is locked,
+    // the OperationContext will not disappear.
+    void lock() {
+        _lock.lock();
+    }
+    void unlock() {
+        _lock.unlock();
+    }
+
+    /**
+     * Makes a new operation context representing an operation on this client.  At most
+     * one operation context may be in scope on a client at a time.
+     *
+     * If provided, the LogicalSessionId links this operation to a logical session.
+     */
+    ServiceContext::UniqueOperationContext makeOperationContext(
+        boost::optional<LogicalSessionId> lsid = boost::none);
+
+    /**
+     * Sets the active operation context on this client to "opCtx", which must be non-NULL.
+     *
+     * It is an error to call this method if there is already an operation context on Client.
+     * It is an error to call this on an unlocked client.
+     */
+    void setOperationContext(OperationContext* opCtx);
+
+    /**
+     * Clears the active operation context on this client.
+     *
+     * There must already be such a context set on this client.
+     * It is an error to call this on an unlocked client.
+     */
+    void resetOperationContext();
+
+    /**
+     * Gets the operation context active on this client, or nullptr if there is no such context.
+     *
+     * It is an error to call this method on an unlocked client, or to use the value returned
+     * by this method while the client is not locked.
+     */
+    OperationContext* getOperationContext() {
+        return _opCtx;
+    }
+
+    // TODO(spencer): SERVER-10228 SERVER-14779 Remove this/move it fully into OperationContext.
+    bool isInDirectClient() const {
+        return _inDirectClient;
+    }
+    void setInDirectClient(bool newVal) {
+        _inDirectClient = newVal;
+    }
+
+    ConnectionId getConnectionId() const {
+        return _connectionId;
+    }
+    bool isFromUserConnection() const {
+        return _connectionId > 0;
+    }
+
+    PseudoRandom& getPrng() {
+        return _prng;
+    }
+
+private:
+    friend class ServiceContext;
+    explicit Client(std::string desc,
+                    ServiceContext* serviceContext,
+                    transport::SessionHandle session);
+
+    ServiceContext* const _serviceContext;
+    const transport::SessionHandle _session;
+
+    // Description for the client (e.g. conn8)
+    const std::string _desc;
+
+    // OS id of the thread, which owns this client
+    const stdx::thread::id _threadId;
+
+    // > 0 for things "conn", 0 otherwise
+    const ConnectionId _connectionId;
+
+    // Protects the contents of the Client (such as changing the OperationContext, etc)
+    SpinLock _lock;
+
+    // Whether this client is running as DBDirectClient
+    bool _inDirectClient = false;
+
+    // If != NULL, then contains the currently active OperationContext
+    OperationContext* _opCtx = nullptr;
+
+    PseudoRandom _prng;
+};
+
+/** get the Client object for this thread. */
+Client& cc();
+
+bool haveClient();
 };

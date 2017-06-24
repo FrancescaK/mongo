@@ -1,5 +1,3 @@
-// counttests.cpp : count.{h,cpp} unit tests.
-
 /**
  *    Copyright (C) 2008 10gen Inc.
  *
@@ -14,129 +12,151 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "../db/ops/count.h"
+#include "mongo/platform/basic.h"
 
-#include "../db/cursor.h"
-#include "../db/pdfile.h"
-
-#include "dbtests.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
+#include "mongo/db/db.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/json.h"
+#include "mongo/dbtests/dbtests.h"
+#include "mongo/stdx/thread.h"
 
 namespace CountTests {
 
-    class Base {
-        dblock lk;
-        Client::Context _context;
-    public:
-        Base() : _context( ns() ) {
-            addIndex( fromjson( "{\"a\":1}" ) );
-        }
-        ~Base() {
-            try {
-                boost::shared_ptr<Cursor> c = theDataFileMgr.findAll( ns() );
-                vector< DiskLoc > toDelete;
-                for(; c->ok(); c->advance() )
-                    toDelete.push_back( c->currLoc() );
-                for( vector< DiskLoc >::iterator i = toDelete.begin(); i != toDelete.end(); ++i )
-                    theDataFileMgr.deleteRecord( ns(), i->rec(), *i, false );
-                DBDirectClient cl;
-                cl.dropIndexes( ns() );
+class Base {
+public:
+    Base()
+        : _lk(&_opCtx, nsToDatabaseSubstring(ns()), MODE_X),
+          _context(&_opCtx, ns()),
+          _client(&_opCtx) {
+        _database = _context.db();
+
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            _collection = _database->getCollection(&_opCtx, ns());
+            if (_collection) {
+                _database->dropCollection(&_opCtx, ns()).transitional_ignore();
             }
-            catch ( ... ) {
-                FAIL( "Exception while cleaning up collection" );
-            }
+            _collection = _database->createCollection(&_opCtx, ns());
+            wunit.commit();
         }
-    protected:
-        static const char *ns() {
-            return "unittests.counttests";
+
+        DBDirectClient client(&_opCtx);
+        client.createIndex(ns(), IndexSpec().addKey("a").unique(false));
+    }
+
+    ~Base() {
+        try {
+            WriteUnitOfWork wunit(&_opCtx);
+            uassertStatusOK(_database->dropCollection(&_opCtx, ns()));
+            wunit.commit();
+        } catch (...) {
+            FAIL("Exception while cleaning up collection");
         }
-        static void addIndex( const BSONObj &key ) {
+    }
+
+protected:
+    static const char* ns() {
+        return "unittests.counttests";
+    }
+
+    void insert(const char* s) {
+        WriteUnitOfWork wunit(&_opCtx);
+        const BSONObj o = fromjson(s);
+        OpDebug* const nullOpDebug = nullptr;
+
+        if (o["_id"].eoo()) {
             BSONObjBuilder b;
-            b.append( "name", key.firstElementFieldName() );
-            b.append( "ns", ns() );
-            b.append( "key", key );
-            BSONObj o = b.done();
-            stringstream indexNs;
-            indexNs << "unittests.system.indexes";
-            theDataFileMgr.insert( indexNs.str().c_str(), o.objdata(), o.objsize() );
+            OID oid;
+            oid.init();
+            b.appendOID("_id", &oid);
+            b.appendElements(o);
+            _collection->insertDocument(&_opCtx, b.obj(), nullOpDebug, false).transitional_ignore();
+        } else {
+            _collection->insertDocument(&_opCtx, o, nullOpDebug, false).transitional_ignore();
         }
-        static void insert( const char *s ) {
-            insert( fromjson( s ) );
-        }
-        static void insert( const BSONObj &o ) {
-            theDataFileMgr.insert( ns(), o.objdata(), o.objsize() );
-        }
-    };
-    
-    class CountBasic : public Base {
-    public:
-        void run() {
-            insert( "{\"a\":\"b\"}" );
-            BSONObj cmd = fromjson( "{\"query\":{}}" );
-            string err;
-            ASSERT_EQUALS( 1, runCount( ns(), cmd, err ) );
-        }
-    };
-    
-    class CountQuery : public Base {
-    public:
-        void run() {
-            insert( "{\"a\":\"b\"}" );
-            insert( "{\"a\":\"b\",\"x\":\"y\"}" );
-            insert( "{\"a\":\"c\"}" );
-            BSONObj cmd = fromjson( "{\"query\":{\"a\":\"b\"}}" );
-            string err;
-            ASSERT_EQUALS( 2, runCount( ns(), cmd, err ) );
-        }
-    };
-    
-    class CountFields : public Base {
-    public:
-        void run() {
-            insert( "{\"a\":\"b\"}" );
-            insert( "{\"c\":\"d\"}" );
-            BSONObj cmd = fromjson( "{\"query\":{},\"fields\":{\"a\":1}}" );
-            string err;
-            ASSERT_EQUALS( 2, runCount( ns(), cmd, err ) );
-        }
-    };
-    
-    class CountQueryFields : public Base {
-    public:
-        void run() {
-            insert( "{\"a\":\"b\"}" );
-            insert( "{\"a\":\"c\"}" );
-            insert( "{\"d\":\"e\"}" );
-            BSONObj cmd = fromjson( "{\"query\":{\"a\":\"b\"},\"fields\":{\"a\":1}}" );
-            string err;
-            ASSERT_EQUALS( 1, runCount( ns(), cmd, err ) );
-        }
-    };
-    
-    class CountIndexedRegex : public Base {
-    public:
-        void run() {
-            insert( "{\"a\":\"b\"}" );
-            insert( "{\"a\":\"c\"}" );
-            BSONObj cmd = fromjson( "{\"query\":{\"a\":/^b/}}" );
-            string err;
-            ASSERT_EQUALS( 1, runCount( ns(), cmd, err ) );
-        }
-    };
-    
-    class All : public Suite {
-    public:
-        All() : Suite( "count" ) {
-        }
-        
-        void setupTests() {
-            add< CountBasic >();
-            add< CountQuery >();
-            add< CountFields >();
-            add< CountQueryFields >();
-            add< CountIndexedRegex >();
-        }
-    } myall;
-    
-} // namespace CountTests
+        wunit.commit();
+    }
+
+    const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
+    OperationContext& _opCtx = *_opCtxPtr;
+    Lock::DBLock _lk;
+
+    OldClientContext _context;
+
+    Database* _database;
+    Collection* _collection;
+
+    DBDirectClient _client;
+};
+
+class Basic : public Base {
+public:
+    void run() {
+        insert("{\"a\":\"b\"}");
+        insert("{\"c\":\"d\"}");
+        ASSERT_EQUALS(2ULL, _client.count(ns(), fromjson("{}")));
+    }
+};
+
+class Query : public Base {
+public:
+    void run() {
+        insert("{\"a\":\"b\"}");
+        insert("{\"a\":\"b\",\"x\":\"y\"}");
+        insert("{\"a\":\"c\"}");
+        ASSERT_EQUALS(2ULL, _client.count(ns(), fromjson("{\"a\":\"b\"}")));
+    }
+};
+
+class QueryFields : public Base {
+public:
+    void run() {
+        insert("{\"a\":\"b\"}");
+        insert("{\"a\":\"c\"}");
+        insert("{\"d\":\"e\"}");
+        ASSERT_EQUALS(1ULL, _client.count(ns(), fromjson("{\"a\":\"b\"}")));
+    }
+};
+
+class IndexedRegex : public Base {
+public:
+    void run() {
+        insert("{\"a\":\"c\"}");
+        insert("{\"a\":\"b\"}");
+        insert("{\"a\":\"d\"}");
+        ASSERT_EQUALS(1ULL, _client.count(ns(), fromjson("{\"a\":/^b/}")));
+    }
+};
+
+class All : public Suite {
+public:
+    All() : Suite("count") {}
+
+    void setupTests() {
+        add<Basic>();
+        add<Query>();
+        add<QueryFields>();
+        add<IndexedRegex>();
+    }
+};
+
+SuiteInstance<All> myall;
+
+}  // namespace CountTests

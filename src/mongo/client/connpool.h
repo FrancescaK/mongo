@@ -2,290 +2,452 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #pragma once
 
+#include <cstdint>
 #include <stack>
-#include "dbclient.h"
-#include "redef_macros.h"
 
-#include "../util/background.h"
+#include "mongo/client/dbclientinterface.h"
+#include "mongo/client/mongo_uri.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/background.h"
+#include "mongo/util/concurrency/mutex.h"
 
 namespace mongo {
 
-    class Shard;
-    class DBConnectionPool;
+class BSONObjBuilder;
+class DBConnectionPool;
+
+namespace executor {
+struct ConnectionPoolStats;
+}  // namespace executor
+
+/**
+ * The PoolForHost is responsible for storing a maximum of _maxPoolSize connections to a particular
+ * host. It is not responsible for creating new connections; instead, when DBConnectionPool is asked
+ * for a connection to a particular host, DBConnectionPool will check if any connections are
+ * available in the PoolForHost for that host. If so, DBConnectionPool will check out a connection
+ * from PoolForHost, and if not, DBConnectionPool will create a new connection itself.
+ *
+ * Once the connection is released back to DBConnectionPool, DBConnectionPool will attempt to
+ * release the connection to PoolForHost. This is how connections enter PoolForHost for the first
+ * time. If PoolForHost is below the _maxPoolSize limit, PoolForHost will take ownership of the
+ * connection, otherwise PoolForHost will clean up and destroy the connection.
+ *
+ * Additionally, PoolForHost knows how to purge itself of stale connections (since a connection can
+ * go stale while it is just sitting in the pool), but does not decide when to do so. Instead,
+ * DBConnectionPool tells PoolForHost to purge stale connections periodically.
+ *
+ * PoolForHost is not thread-safe; thread safety is handled by DBConnectionPool.
+ */
+class PoolForHost {
+    MONGO_DISALLOW_COPYING(PoolForHost);
+
+public:
+    // Sentinel value indicating pool has no cleanup limit
+    static const int kPoolSizeUnlimited;
+
+    friend class DBConnectionPool;
+
+    PoolForHost()
+        : _created(0),
+          _minValidCreationTimeMicroSec(0),
+          _type(ConnectionString::INVALID),
+          _maxPoolSize(kPoolSizeUnlimited),
+          _checkedOut(0),
+          _badConns(0),
+          _parentDestroyed(false) {}
+
+    ~PoolForHost();
 
     /**
-     * not thread safe
-     * thread safety is handled by DBConnectionPool
+     * Returns the number of connections in this pool that went bad.
      */
-    class PoolForHost {
-    public:
-        PoolForHost()
-            : _created(0) {}
+    int getNumBadConns() const {
+        return _badConns;
+    }
 
-        PoolForHost( const PoolForHost& other ) {
-            assert(other._pool.size() == 0);
-            _created = other._created;
-            assert( _created == 0 );
-        }
+    /**
+     * Returns the maximum number of connections stored in the pool
+     */
+    int getMaxPoolSize() const {
+        return _maxPoolSize;
+    }
 
-        ~PoolForHost();
+    /**
+     * Sets the maximum number of connections stored in the pool
+     */
+    void setMaxPoolSize(int maxPoolSize) {
+        _maxPoolSize = maxPoolSize;
+    }
 
-        int numAvailable() const { return (int)_pool.size(); }
+    /**
+     * Sets the socket timeout on this host, for reporting purposes only.
+     */
+    void setSocketTimeout(double socketTimeout) {
+        _socketTimeout = socketTimeout;
+    }
 
-        void createdOne( DBClientBase * base );
-        long long numCreated() const { return _created; }
+    int numAvailable() const {
+        return (int)_pool.size();
+    }
 
-        ConnectionString::ConnectionType type() const { assert(_created); return _type; }
+    int numInUse() const {
+        return _checkedOut;
+    }
 
-        /**
-         * gets a connection or return NULL
-         */
-        DBClientBase * get( DBConnectionPool * pool , double socketTimeout );
+    /**
+     * Returns the number of open connections in this pool.
+     */
+    int openConnections() const {
+        return numInUse() + numAvailable();
+    }
 
-        void done( DBConnectionPool * pool , DBClientBase * c );
+    void createdOne(DBClientBase* base);
+    long long numCreated() const {
+        return _created;
+    }
 
-        void flush();
-        
-        void getStaleConnections( vector<DBClientBase*>& stale );
+    ConnectionString::ConnectionType type() const {
+        verify(_created);
+        return _type;
+    }
 
-        static void setMaxPerHost( unsigned max ) { _maxPerHost = max; }
-        static unsigned getMaxPerHost() { return _maxPerHost; }
-    private:
+    /**
+     * gets a connection or return NULL
+     */
+    DBClientBase* get(DBConnectionPool* pool, double socketTimeout);
 
-        struct StoredConnection {
-            StoredConnection( DBClientBase * c );
+    // Deletes all connections in the pool
+    void clear();
 
-            bool ok( time_t now );
+    void done(DBConnectionPool* pool, DBClientBase* c);
 
-            DBClientBase* conn;
-            time_t when;
-        };
+    void flush();
 
-        std::stack<StoredConnection> _pool;
-        
-        long long _created;
-        ConnectionString::ConnectionType _type;
+    void getStaleConnections(std::vector<DBClientBase*>& stale);
 
-        static unsigned _maxPerHost;
+    /**
+     * Sets the lower bound for creation times that can be considered as
+     *     good connections.
+     */
+    void reportBadConnectionAt(uint64_t microSec);
+
+    /**
+     * @return true if the given creation time is considered to be not
+     *     good for use.
+     */
+    bool isBadSocketCreationTime(uint64_t microSec);
+
+    /**
+     * Sets the host name to a new one, only if it is currently empty.
+     */
+    void initializeHostName(const std::string& hostName);
+
+private:
+    struct StoredConnection {
+        StoredConnection(std::unique_ptr<DBClientBase> c);
+
+        bool ok();
+
+        std::unique_ptr<DBClientBase> conn;
+        time_t when;
     };
 
-    class DBConnectionHook {
-    public:
-        virtual ~DBConnectionHook() {}
-        virtual void onCreate( DBClientBase * conn ) {}
-        virtual void onHandedOut( DBClientBase * conn ) {}
-        virtual void onDestroy( DBClientBase * conn ) {}
+    std::string _hostName;
+    double _socketTimeout;
+    std::stack<StoredConnection> _pool;
+
+    int64_t _created;
+    uint64_t _minValidCreationTimeMicroSec;
+    ConnectionString::ConnectionType _type;
+
+    // The maximum number of connections we'll save in the pool
+    int _maxPoolSize;
+
+    // The number of currently active connections from this pool
+    int _checkedOut;
+
+    // The number of connections that we did not reuse because they went bad.
+    int _badConns;
+
+    // Whether our parent DBConnectionPool object is in destruction
+    bool _parentDestroyed;
+};
+
+class DBConnectionHook {
+public:
+    virtual ~DBConnectionHook() {}
+    virtual void onCreate(DBClientBase* conn) {}
+    virtual void onHandedOut(DBClientBase* conn) {}
+    virtual void onRelease(DBClientBase* conn) {}
+    virtual void onDestroy(DBClientBase* conn) {}
+};
+
+/** Database connection pool.
+
+    Generally, use ScopedDbConnection and do not call these directly.
+
+    This class, so far, is suitable for use with unauthenticated connections.
+    Support for authenticated connections requires some adjustments: please
+    request...
+
+    Usage:
+
+    {
+       ScopedDbConnection c("myserver");
+       c.conn()...
+    }
+*/
+class DBConnectionPool : public PeriodicTask {
+public:
+    DBConnectionPool();
+    ~DBConnectionPool();
+
+    /** right now just controls some asserts.  defaults to "dbconnectionpool" */
+    void setName(const std::string& name) {
+        _name = name;
+    }
+
+    /**
+     * Returns the maximum number of connections pooled per-host
+     *
+     * This setting only applies to new host connection pools, previously-pooled host pools are
+     * unaffected.
+     */
+    int getMaxPoolSize() const {
+        return _maxPoolSize;
+    }
+
+    /**
+     * Returns the number of connections to the given host pool.
+     */
+    int openConnections(const std::string& ident, double socketTimeout);
+
+    /**
+     * Sets the maximum number of connections pooled per-host.
+     *
+     * This setting only applies to new host connection pools, previously-pooled host pools are
+     * unaffected.
+     */
+    void setMaxPoolSize(int maxPoolSize) {
+        _maxPoolSize = maxPoolSize;
+    }
+
+    void onCreate(DBClientBase* conn);
+    void onHandedOut(DBClientBase* conn);
+    void onDestroy(DBClientBase* conn);
+    void onRelease(DBClientBase* conn);
+
+    void flush();
+
+    DBClientBase* get(const std::string& host, double socketTimeout = 0);
+    DBClientBase* get(const ConnectionString& host, double socketTimeout = 0);
+    DBClientBase* get(const MongoURI& uri, double socketTimeout = 0);
+
+    /**
+     * Gets the number of connections available in the pool.
+     */
+    int getNumAvailableConns(const std::string& host, double socketTimeout = 0) const;
+    int getNumBadConns(const std::string& host, double socketTimeout = 0) const;
+
+    void release(const std::string& host, DBClientBase* c);
+
+    void addHook(DBConnectionHook* hook);  // we take ownership
+    void appendConnectionStats(executor::ConnectionPoolStats* stats) const;
+
+    /**
+     * Clears all connections for all host.
+     */
+    void clear();
+
+    /**
+     * Checks whether the connection for a given host is black listed or not.
+     *
+     * @param hostName the name of the host the connection connects to.
+     * @param conn the connection to check.
+     *
+     * @return true if the connection is not bad, meaning, it is good to keep it for
+     *     future use.
+     */
+    bool isConnectionGood(const std::string& host, DBClientBase* conn);
+
+    // Removes and deletes all connections from the pool for the host (regardless of timeout)
+    void removeHost(const std::string& host);
+
+    /** compares server namees, but is smart about replica set names */
+    struct serverNameCompare {
+        bool operator()(const std::string& a, const std::string& b) const;
     };
 
-    /** Database connection pool.
+    virtual std::string taskName() const {
+        return "DBConnectionPool-cleaner";
+    }
+    virtual void taskDoWork();
 
-        Generally, use ScopedDbConnection and do not call these directly.
+private:
+    DBConnectionPool(DBConnectionPool& p);
 
-        This class, so far, is suitable for use with unauthenticated connections.
-        Support for authenticated connections requires some adjustements: please
-        request...
+    DBClientBase* _get(const std::string& ident, double socketTimeout);
 
-        Usage:
+    DBClientBase* _finishCreate(const std::string& ident, double socketTimeout, DBClientBase* conn);
 
-        {
-           ScopedDbConnection c("myserver");
-           c.conn()...
-        }
-    */
-    class DBConnectionPool : public PeriodicTask {
-        
-    public:
-
-        DBConnectionPool();
-        ~DBConnectionPool();
-
-        /** right now just controls some asserts.  defaults to "dbconnectionpool" */
-        void setName( const string& name ) { _name = name; }
-
-        void onCreate( DBClientBase * conn );
-        void onHandedOut( DBClientBase * conn );
-        void onDestroy( DBClientBase * conn );
-
-        void flush();
-
-        DBClientBase *get(const string& host, double socketTimeout = 0);
-        DBClientBase *get(const ConnectionString& host, double socketTimeout = 0);
-
-        void release(const string& host, DBClientBase *c);
-
-        void addHook( DBConnectionHook * hook ); // we take ownership
-        void appendInfo( BSONObjBuilder& b );
-
-        /** compares server namees, but is smart about replica set names */
-        struct serverNameCompare {
-            bool operator()( const string& a , const string& b ) const;
-        };
-
-        virtual string taskName() const { return "DBConnectionPool-cleaner"; }
-        virtual void taskDoWork();        
-
-    private:
-        DBConnectionPool( DBConnectionPool& p );
-        
-        DBClientBase* _get( const string& ident , double socketTimeout );
-
-        DBClientBase* _finishCreate( const string& ident , double socketTimeout, DBClientBase* conn );
-        
-        struct PoolKey {
-            PoolKey( string i , double t ) : ident( i ) , timeout( t ) {}
-            string ident;
-            double timeout;
-        };
-
-        struct poolKeyCompare {
-            bool operator()( const PoolKey& a , const PoolKey& b ) const;
-        };
-
-        typedef map<PoolKey,PoolForHost,poolKeyCompare> PoolMap; // servername -> pool
-
-        mongo::mutex _mutex;
-        string _name;
-        
-        PoolMap _pools;
-
-        // pointers owned by me, right now they leak on shutdown
-        // _hooks itself also leaks because it creates a shutdown race condition
-        list<DBConnectionHook*> * _hooks; 
-
+    struct PoolKey {
+        PoolKey(const std::string& i, double t) : ident(i), timeout(t) {}
+        std::string ident;
+        double timeout;
     };
 
-    extern DBConnectionPool pool;
-
-    class AScopedConnection : boost::noncopyable {
-    public:
-        AScopedConnection() { _numConnections++; }
-        virtual ~AScopedConnection() { _numConnections--; }
-        
-        virtual DBClientBase* get() = 0;
-        virtual void done() = 0;
-        virtual string getHost() const = 0;
-        
-        /** 
-         * @return true iff this has a connection to the db
-         */
-        virtual bool ok() const = 0;
-
-        /**
-         * @return total number of current instances of AScopedConnection
-         */
-        static int getNumConnections() { return _numConnections; }
-
-    private:
-        static AtomicUInt _numConnections;
+    struct poolKeyCompare {
+        bool operator()(const PoolKey& a, const PoolKey& b) const;
     };
 
-    /** Use to get a connection from the pool.  On exceptions things
-       clean up nicely (i.e. the socket gets closed automatically when the
-       scopeddbconnection goes out of scope).
-    */
-    class ScopedDbConnection : public AScopedConnection {
-    public:
-        /** the main constructor you want to use
-            throws UserException if can't connect
-            */
-        explicit ScopedDbConnection(const string& host, double socketTimeout = 0) : _host(host), _conn( pool.get(host, socketTimeout) ), _socketTimeout( socketTimeout ) {
-            _setSocketTimeout();
-        }
+    typedef std::map<PoolKey, PoolForHost, poolKeyCompare> PoolMap;  // servername -> pool
 
-        ScopedDbConnection() : _host( "" ) , _conn(0), _socketTimeout( 0 ) {}
+    mutable stdx::mutex _mutex;
+    std::string _name;
 
-        /* @param conn - bind to an existing connection */
-        ScopedDbConnection(const string& host, DBClientBase* conn, double socketTimeout = 0 ) : _host( host ) , _conn( conn ), _socketTimeout( socketTimeout ) {
-            _setSocketTimeout();
-        }
+    // The maximum number of connections we'll save in the pool per-host
+    // PoolForHost::kPoolSizeUnlimited is a sentinel value meaning "no limit"
+    // 0 effectively disables the pool
+    int _maxPoolSize;
 
-        /** throws UserException if can't connect */
-        explicit ScopedDbConnection(const ConnectionString& url, double socketTimeout = 0 ) : _host(url.toString()), _conn( pool.get(url, socketTimeout) ), _socketTimeout( socketTimeout ) {
-            _setSocketTimeout();
-        }
+    PoolMap _pools;
 
-        /** throws UserException if can't connect */
-        explicit ScopedDbConnection(const Shard& shard, double socketTimeout = 0 );
-        explicit ScopedDbConnection(const Shard* shard, double socketTimeout = 0 );
+    // pointers owned by me, right now they leak on shutdown
+    // _hooks itself also leaks because it creates a shutdown race condition
+    std::list<DBConnectionHook*>* _hooks;
+};
 
-        ~ScopedDbConnection();
+class AScopedConnection {
+    MONGO_DISALLOW_COPYING(AScopedConnection);
 
-        /** get the associated connection object */
-        DBClientBase* operator->() {
-            uassert( 11004 ,  "connection was returned to the pool already" , _conn );
-            return _conn;
-        }
+public:
+    AScopedConnection() {
+        _numConnections.fetchAndAdd(1);
+    }
+    virtual ~AScopedConnection() {
+        _numConnections.fetchAndAdd(-1);
+    }
 
-        /** get the associated connection object */
-        DBClientBase& conn() {
-            uassert( 11005 ,  "connection was returned to the pool already" , _conn );
-            return *_conn;
-        }
+    virtual DBClientBase* get() = 0;
+    virtual void done() = 0;
+    virtual std::string getHost() const = 0;
 
-        /** get the associated connection object */
-        DBClientBase* get() {
-            uassert( 13102 ,  "connection was returned to the pool already" , _conn );
-            return _conn;
-        }
+    /**
+     * @return true iff this has a connection to the db
+     */
+    virtual bool ok() const = 0;
 
-        bool ok() const { return _conn > 0; }
+    /**
+     * @return total number of current instances of AScopedConnection
+     */
+    static int getNumConnections() {
+        return _numConnections.load();
+    }
 
-        string getHost() const { return _host; }
+private:
+    static AtomicInt32 _numConnections;
+};
 
-        /** Force closure of the connection.  You should call this if you leave it in
-            a bad state.  Destructor will do this too, but it is verbose.
+/** Use to get a connection from the pool.  On exceptions things
+   clean up nicely (i.e. the socket gets closed automatically when the
+   scopeddbconnection goes out of scope).
+*/
+class ScopedDbConnection : public AScopedConnection {
+public:
+    /** the main constructor you want to use
+        throws UserException if can't connect
         */
-        void kill() {
-            delete _conn;
-            _conn = 0;
-        }
+    explicit ScopedDbConnection(const std::string& host, double socketTimeout = 0);
+    explicit ScopedDbConnection(const ConnectionString& host, double socketTimeout = 0);
+    explicit ScopedDbConnection(const MongoURI& host, double socketTimeout = 0);
 
-        /** Call this when you are done with the connection.
+    ScopedDbConnection() : _host(""), _conn(0), _socketTimeout(0) {}
 
-            If you do not call done() before this object goes out of scope,
-            we can't be sure we fully read all expected data of a reply on the socket.  so
-            we don't try to reuse the connection in that situation.
-        */
-        void done() {
-            if ( ! _conn )
-                return;
+    /* @param conn - bind to an existing connection */
+    ScopedDbConnection(const std::string& host, DBClientBase* conn, double socketTimeout = 0)
+        : _host(host), _conn(conn), _socketTimeout(socketTimeout) {
+        _setSocketTimeout();
+    }
 
-            /* we could do this, but instead of assume one is using autoreconnect mode on the connection
-            if ( _conn->isFailed() )
-                kill();
-            else
-            */
-            pool.release(_host, _conn);
-            _conn = 0;
-        }
+    ~ScopedDbConnection();
 
-        ScopedDbConnection * steal();
+    static void clearPool();
 
-    private:
+    /** get the associated connection object */
+    DBClientBase* operator->() {
+        uassert(11004, "connection was returned to the pool already", _conn);
+        return _conn;
+    }
 
-        void _setSocketTimeout();
+    /** get the associated connection object */
+    DBClientBase& conn() {
+        uassert(11005, "connection was returned to the pool already", _conn);
+        return *_conn;
+    }
 
-        const string _host;
-        DBClientBase *_conn;
-        const double _socketTimeout;
+    /** get the associated connection object */
+    DBClientBase* get() {
+        uassert(13102, "connection was returned to the pool already", _conn);
+        return _conn;
+    }
 
-    };
+    bool ok() const {
+        return _conn != NULL;
+    }
 
-} // namespace mongo
+    std::string getHost() const {
+        return _host;
+    }
 
-#include "undef_macros.h"
+    /** Force closure of the connection.  You should call this if you leave it in
+        a bad state.  Destructor will do this too, but it is verbose.
+    */
+    void kill() {
+        delete _conn;
+        _conn = 0;
+    }
+
+    /** Call this when you are done with the connection.
+
+        If you do not call done() before this object goes out of scope,
+        we can't be sure we fully read all expected data of a reply on the socket.  so
+        we don't try to reuse the connection in that situation.
+    */
+    void done();
+
+private:
+    void _setSocketTimeout();
+
+    const std::string _host;
+    DBClientBase* _conn;
+    const double _socketTimeout;
+};
+
+}  // namespace mongo

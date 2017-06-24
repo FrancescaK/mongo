@@ -1,291 +1,232 @@
-// @file version.cpp
-
-/*    Copyright 2009 10gen Inc.
+/*    Copyright 2016 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "pch.h"
-#include <cstdlib>
-#include <iostream>
-#include <iomanip>
-#include <sstream>
-#include <string>
-#include <fstream>
-#include "unittest.h"
-#include "version.h"
-#include "stringutils.h"
-#include "../db/jsobj.h"
-#include "file.h"
-#include "ramlog.h"
-#include "../db/cmdline.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
-#include <boost/filesystem/operations.hpp>
+#include "mongo/platform/basic.h"
+
+#include "mongo/util/version.h"
+
+#include "mongo/config.h"
+
+#ifdef MONGO_CONFIG_SSL
+#include <openssl/crypto.h>
+#endif
+
+#include <pcrecpp.h>
+
+#include <sstream>
+
+#include "mongo/db/jsobj.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+namespace {
 
-    /* Approved formats for versionString:
-     *      1.2.3
-     *      1.2.3-pre-
-     *      1.2.3-rc4 (up to rc9)
-     *      1.2.3-rc4-pre-
-     * If you really need to do something else you'll need to fix _versionArray()
-     */
-    const char versionString[] = "2.1.0-pre-";
-
-    // See unit test for example outputs
-    static BSONArray _versionArray(const char* version){
-        // this is inefficient, but cached so it doesn't matter
-        BSONArrayBuilder b;
-        string curPart;
-        const char* c = version;
-        int finalPart = 0; // 0 = final release, -100 = pre, -10 to -1 = -10 + X for rcX
-        do { //walks versionString including NUL byte
-            if (!(*c == '.' || *c == '-' || *c == '\0')){
-                curPart += *c;
-                continue;
-            }
-
-            try {
-                unsigned num = stringToNum(curPart.c_str());
-                b.append((int) num);
-            }
-            catch (...){ // not a number
-                if (curPart.empty()){
-                    assert(*c == '\0');
-                    break;
-                }
-                else if (startsWith(curPart, "rc")){
-                    finalPart = -10 + stringToNum(curPart.c_str()+2);
-                    break;
-                }
-                else if (curPart == "pre"){
-                    finalPart = -100;
-                    break;
-                }
-            }
-
-            curPart = "";
-        } while (*c++);
-
-        b.append(finalPart);
-        return b.arr();
+const class : public VersionInfoInterface {
+public:
+    int majorVersion() const noexcept final {
+        return 0;
     }
 
-    const BSONArray versionArray = _versionArray(versionString);
-
-    string mongodVersion() {
-        stringstream ss;
-        ss << "db version v" << versionString << ", pdfile version " << PDFILE_VERSION << "." << PDFILE_VERSION_MINOR;
-        return ss.str();
+    int minorVersion() const noexcept final {
+        return 0;
     }
 
-#ifndef _SCONS
-    // only works in scons
-    const char * gitVersion() { return "not-scons"; }
-#endif
-
-    void printGitVersion() { log() << "git version: " << gitVersion() << endl; }
-
-#ifndef _SCONS
-#if defined(_WIN32)
-    string sysInfo() {
-        stringstream ss;
-        ss << "not-scons win";
-        ss << " mscver:" << _MSC_FULL_VER << " built:" << __DATE__;
-        ss << " boostver:" << BOOST_VERSION;
-#if( !defined(_MT) )
-#error _MT is not defined
-#endif
-        ss << (sizeof(char *) == 8) ? " 64bit" : " 32bit";
-        return ss.str();
-    }
-#else
-    string sysInfo() { return ""; }
-#endif
-#endif
-
-    void printSysInfo() {
-        log() << "build info: " << sysInfo() << endl;
+    int patchVersion() const noexcept final {
+        return 0;
     }
 
-
-    static Tee * startupWarningsLog = new RamLog("startupWarnings"); //intentionally leaked
-
-    //
-    // system warnings
-    //
-    void show_warnings() {
-        // each message adds a leading and a trailing newline
-
-        bool warned = false;
-        {
-            const char * foo = strchr( versionString , '.' ) + 1;
-            int bar = atoi( foo );
-            if ( ( 2 * ( bar / 2 ) ) != bar ) {
-                log() << startupWarningsLog;
-                log() << "** NOTE: This is a development version (" << versionString << ") of MongoDB." << startupWarningsLog;
-                log() << "**       Not recommended for production." << startupWarningsLog;
-                warned = true;
-            }
-        }
-
-        if ( sizeof(int*) == 4 ) {
-            log() << startupWarningsLog;
-            log() << "** NOTE: when using MongoDB 32 bit, you are limited to about 2 gigabytes of data" << startupWarningsLog;
-            log() << "**       see http://blog.mongodb.org/post/137788967/32-bit-limitations" << startupWarningsLog;
-            log() << "**       with --journal, the limit is lower" << startupWarningsLog;
-            warned = true;
-        }
-
-#ifdef __linux__
-        if (boost::filesystem::exists("/proc/vz") && !boost::filesystem::exists("/proc/bc")) {
-            log() << startupWarningsLog;
-            log() << "** WARNING: You are running in OpenVZ. This is known to be broken!!!" << startupWarningsLog;
-            warned = true;
-        }
-
-        if (boost::filesystem::exists("/sys/devices/system/node/node1")){
-            // We are on a box with a NUMA enabled kernel and more than 1 numa node (they start at node0)
-            // Now we look at the first line of /proc/self/numa_maps
-            //
-            // Bad example:
-            // $ cat /proc/self/numa_maps
-            // 00400000 default file=/bin/cat mapped=6 N4=6
-            //
-            // Good example:
-            // $ numactl --interleave=all cat /proc/self/numa_maps
-            // 00400000 interleave:0-7 file=/bin/cat mapped=6 N4=6
-
-            File f;
-            f.open("/proc/self/numa_maps", /*read_only*/true);
-            if ( f.is_open() && ! f.bad() ) {
-                char line[100]; //we only need the first line
-                if (read(f.fd, line, sizeof(line)) < 0){
-                    warning() << "failed to read from /proc/self/numa_maps: " << errnoWithDescription() << startupWarningsLog;
-                    warned = true;
-                }
-                else {
-                    // just in case...
-                    line[98] = ' ';
-                    line[99] = '\0';
-                    
-                    // skip over pointer
-                    const char* space = strchr(line, ' ');
-                    
-                    if ( ! space ) {
-                        log() << startupWarningsLog;
-                        log() << "** WARNING: cannot parse numa_maps" << startupWarningsLog;
-                        warned = true;
-                    }
-                    else if ( ! startsWith(space+1, "interleave") ) {
-                        log() << startupWarningsLog;
-                        log() << "** WARNING: You are running on a NUMA machine." << startupWarningsLog;
-                        log() << "**          We suggest launching mongod like this to avoid performance problems:" << startupWarningsLog;
-                        log() << "**              numactl --interleave=all mongod [other options]" << startupWarningsLog;
-                        warned = true;
-                    }
-                }
-            }
-        }
-
-        if (cmdLine.dur){
-            fstream f ("/proc/sys/vm/overcommit_memory", ios_base::in);
-            unsigned val;
-            f >> val;
-
-            if (val == 2) {
-                log() << startupWarningsLog;
-                log() << "** WARNING: /proc/sys/vm/overcommit_memory is " << val << startupWarningsLog;
-                log() << "**          Journaling works best with it set to 0 or 1" << startupWarningsLog;
-            }
-        }
-
-        if (boost::filesystem::exists("/proc/sys/vm/zone_reclaim_mode")){
-            fstream f ("/proc/sys/vm/zone_reclaim_mode", ios_base::in);
-            unsigned val;
-            f >> val;
-
-            if (val != 0) {
-                log() << startupWarningsLog;
-                log() << "** WARNING: /proc/sys/vm/zone_reclaim_mode is " << val << startupWarningsLog;
-                log() << "**          We suggest setting it to 0" << startupWarningsLog;
-                log() << "**          http://www.kernel.org/doc/Documentation/sysctl/vm.txt" << startupWarningsLog;
-            }
-        }
-#endif
-
-        if (warned) {
-            log() << startupWarningsLog;
-        }
+    int extraVersion() const noexcept final {
+        return 0;
     }
 
-    int versionCmp(StringData rhs, StringData lhs) {
-        if (strcmp(rhs.data(),lhs.data()) == 0)
-            return 0;
-
-        // handle "1.2.3-" and "1.2.3-pre"
-        if (rhs.size() < lhs.size()) {
-            if (strncmp(rhs.data(), lhs.data(), rhs.size()) == 0 && lhs.data()[rhs.size()] == '-')
-                return +1;
-        }
-        else if (rhs.size() > lhs.size()) {
-            if (strncmp(rhs.data(), lhs.data(), lhs.size()) == 0 && rhs.data()[lhs.size()] == '-')
-                return -1;
-        }
-
-        return lexNumCmp(rhs.data(), lhs.data());
+    StringData version() const noexcept final {
+        return "unknown";
     }
 
-    class VersionCmpTest : public UnitTest {
-    public:
-        void run() {
-            assert( versionCmp("1.2.3", "1.2.3") == 0 );
-            assert( versionCmp("1.2.3", "1.2.4") < 0 );
-            assert( versionCmp("1.2.3", "1.2.20") < 0 );
-            assert( versionCmp("1.2.3", "1.20.3") < 0 );
-            assert( versionCmp("2.2.3", "10.2.3") < 0 );
-            assert( versionCmp("1.2.3", "1.2.3-") > 0 );
-            assert( versionCmp("1.2.3", "1.2.3-pre") > 0 );
-            assert( versionCmp("1.2.3", "1.2.4-") < 0 );
-            assert( versionCmp("1.2.3-", "1.2.3") < 0 );
-            assert( versionCmp("1.2.3-pre", "1.2.3") < 0 );
+    StringData gitVersion() const noexcept final {
+        return "none";
+    }
 
-            log(1) << "versionCmpTest passed" << endl;
-        }
-    } versionCmpTest;
+    std::vector<StringData> modules() const final {
+        return {"unknown"};
+    }
 
-    class VersionArrayTest : public UnitTest {
-    public:
-        void run() {
-            assert( _versionArray("1.2.3") == BSON_ARRAY(1 << 2 << 3 << 0) );
-            assert( _versionArray("1.2.0") == BSON_ARRAY(1 << 2 << 0 << 0) );
-            assert( _versionArray("2.0.0") == BSON_ARRAY(2 << 0 << 0 << 0) );
+    StringData allocator() const noexcept final {
+        return "unknown";
+    }
 
-            assert( _versionArray("1.2.3-pre-") == BSON_ARRAY(1 << 2 << 3 << -100) );
-            assert( _versionArray("1.2.0-pre-") == BSON_ARRAY(1 << 2 << 0 << -100) );
-            assert( _versionArray("2.0.0-pre-") == BSON_ARRAY(2 << 0 << 0 << -100) );
+    StringData jsEngine() const noexcept final {
+        return "unknown";
+    }
 
-            assert( _versionArray("1.2.3-rc0") == BSON_ARRAY(1 << 2 << 3 << -10) );
-            assert( _versionArray("1.2.0-rc1") == BSON_ARRAY(1 << 2 << 0 << -9) );
-            assert( _versionArray("2.0.0-rc2") == BSON_ARRAY(2 << 0 << 0 << -8) );
+    StringData targetMinOS() const noexcept final {
+        return "unknown";
+    }
 
-            // Note that the pre of an rc is the same as the rc itself
-            assert( _versionArray("1.2.3-rc3-pre-") == BSON_ARRAY(1 << 2 << 3 << -7) );
-            assert( _versionArray("1.2.0-rc4-pre-") == BSON_ARRAY(1 << 2 << 0 << -6) );
-            assert( _versionArray("2.0.0-rc5-pre-") == BSON_ARRAY(2 << 0 << 0 << -5) );
+    std::vector<BuildInfoTuple> buildInfo() const final {
+        return {};
+    }
 
-            log(1) << "versionArrayTest passed" << endl;
-        }
-    } versionArrayTest;
+} kFallbackVersionInfo{};
+
+const VersionInfoInterface* globalVersionInfo = nullptr;
+
+}  // namespace
+
+void VersionInfoInterface::enable(const VersionInfoInterface* handler) {
+    globalVersionInfo = handler;
 }
+
+const VersionInfoInterface& VersionInfoInterface::instance(NotEnabledAction action) noexcept {
+    if (globalVersionInfo)
+        return *globalVersionInfo;
+    if (action == NotEnabledAction::kFallback)
+        return kFallbackVersionInfo;
+    severe() << "Terminating because valid version info has not been configured";
+    fassertFailed(40278);
+}
+
+bool VersionInfoInterface::isSameMajorVersion(const char* otherVersion) const noexcept {
+    int major = -1, minor = -1;
+    pcrecpp::RE ver_regex("^(\\d+)\\.(\\d+)\\.");
+    ver_regex.PartialMatch(otherVersion, &major, &minor);
+
+    if (major == -1 || minor == -1)
+        return false;
+
+    return (major == majorVersion() && minor == minorVersion());
+}
+
+std::string VersionInfoInterface::makeVersionString(StringData binaryName) const {
+    std::stringstream ss;
+    ss << binaryName << " v" << version();
+    return ss.str();
+}
+
+void VersionInfoInterface::appendBuildInfo(BSONObjBuilder* result) const {
+    *result << "version" << version() << "gitVersion" << gitVersion()
+#if defined(_WIN32)
+            << "targetMinOS" << targetMinOS()
+#endif
+            << "modules" << modules() << "allocator" << allocator() << "javascriptEngine"
+            << jsEngine() << "sysInfo"
+            << "deprecated";
+
+    BSONArrayBuilder versionArray(result->subarrayStart("versionArray"));
+    versionArray << majorVersion() << minorVersion() << patchVersion() << extraVersion();
+    versionArray.done();
+
+    BSONObjBuilder opensslInfo(result->subobjStart("openssl"));
+#ifdef MONGO_CONFIG_SSL
+    opensslInfo << "running" << openSSLVersion() << "compiled" << OPENSSL_VERSION_TEXT;
+#else
+    opensslInfo << "running"
+                << "disabled"
+                << "compiled"
+                << "disabled";
+#endif
+    opensslInfo.done();
+
+    BSONObjBuilder buildvarsInfo(result->subobjStart("buildEnvironment"));
+    for (auto&& envDataEntry : buildInfo()) {
+        if (std::get<2>(envDataEntry)) {
+            buildvarsInfo << std::get<0>(envDataEntry) << std::get<1>(envDataEntry);
+        }
+    }
+    buildvarsInfo.done();
+
+    *result << "bits" << (int)sizeof(void*) * 8;
+    result->appendBool("debug", kDebugBuild);
+    result->appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
+}
+
+std::string VersionInfoInterface::openSSLVersion(StringData prefix, StringData suffix) const {
+#ifndef MONGO_CONFIG_SSL
+    return "";
+#else
+    return prefix.toString() + SSLeay_version(SSLEAY_VERSION) + suffix;
+#endif
+}
+
+void VersionInfoInterface::logTargetMinOS() const {
+    log() << "targetMinOS: " << targetMinOS();
+}
+
+void VersionInfoInterface::logBuildInfo() const {
+    log() << "git version: " << gitVersion();
+
+#ifdef MONGO_CONFIG_SSL
+    log() << openSSLVersion("OpenSSL version: ");
+#endif
+
+    log() << "allocator: " << allocator();
+
+    std::stringstream ss;
+    ss << "modules: ";
+    auto modules_list = modules();
+    if (modules_list.size() == 0) {
+        ss << "none";
+    } else {
+        for (const auto& m : modules_list) {
+            ss << m << " ";
+        }
+    }
+    log() << ss.str();
+
+    log() << "build environment:";
+    for (auto&& envDataEntry : buildInfo()) {
+        if (std::get<3>(envDataEntry)) {
+            auto val = std::get<1>(envDataEntry);
+            if (val.size() == 0)
+                continue;
+            log() << "    " << std::get<0>(envDataEntry) << ": " << std::get<1>(envDataEntry);
+        }
+    }
+}
+
+std::string mongoShellVersion(const VersionInfoInterface& provider) {
+    std::stringstream ss;
+    ss << "MongoDB shell version v" << provider.version();
+    return ss.str();
+}
+
+std::string mongosVersion(const VersionInfoInterface& provider) {
+    std::stringstream ss;
+    ss << "mongos version v" << provider.version();
+    return ss.str();
+}
+
+std::string mongodVersion(const VersionInfoInterface& provider) {
+    std::stringstream ss;
+    ss << "db version v" << provider.version();
+    return ss.str();
+}
+
+}  // namespace mongo

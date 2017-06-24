@@ -1,53 +1,53 @@
-// FAILING TEST
 // should check that election happens in priority order
 
-doTest = function( signal ) {
+(function() {
+    "use strict";
+    var replTest = new ReplSetTest({name: 'testSet', nodes: 3});
+    var nodenames = replTest.nodeList();
 
-    var replTest = new ReplSetTest( {name: 'testSet', nodes: 3} );
-    var nodes = replTest.nodeList();
+    var nodes = replTest.startSet();
+    replTest.initiate({
+        "_id": "testSet",
+        "members": [
+            {"_id": 0, "host": nodenames[0], "priority": 1},
+            {"_id": 1, "host": nodenames[1], "priority": 2},
+            {"_id": 2, "host": nodenames[2], "priority": 3}
+        ]
+    });
 
-    replTest.startSet();
-    replTest.node[0].initiate({"_id" : "unicomplex", 
-                "members" : [
-                             {"_id" : 0, "host" : nodes[0], "priority" : 1}, 
-                             {"_id" : 1, "host" : nodes[1], "priority" : 2}, 
-                             {"_id" : 2, "host" : nodes[2], "priority" : 3}]});
+    // 2 should be master (give this a while to happen, as other nodes might first be elected)
+    replTest.waitForState(nodes[2], ReplSetTest.State.PRIMARY);
+    // wait for 1 to not appear to be master (we are about to make it master and need a clean slate
+    // here)
+    replTest.waitForState(nodes[1], ReplSetTest.State.SECONDARY);
 
-    sleep(10000);
-
-    // 2 should be master
-    var m3 = replTest.nodes[2].runCommand({ismaster:1})
-
-    // FAILS: node[0] is elected master, regardless of priority
-    assert(m3.ismaster, 'highest priority is master');
+    // Wait for election oplog entry to be replicated, to ensure 0 will vote for 1 after stopping 2.
+    replTest.awaitReplication();
 
     // kill 2, 1 should take over
-    var m3Id = replTest.getNodeId(nodes[2]);
-    replTest.stop(m3Id);
+    replTest.stop(2);
 
-    sleep(10000);
+    // 1 should eventually be master
+    replTest.waitForState(nodes[1], ReplSetTest.State.PRIMARY, 60000);
 
-    var m2 = replTest.nodes[1].runCommand({ismaster:1})
-    assert(m2.ismaster, 'node 2 is master');
+    // do some writes on 1
+    var master = replTest.getPrimary();
+    for (var i = 0; i < 1000; i++) {
+        assert.writeOK(master.getDB("foo").bar.insert({i: i}, {writeConcern: {w: 'majority'}}));
+    }
 
-    // bring 2 back up, nothing should happen
-    replTest.start(m3Id);
+    for (i = 0; i < 1000; i++) {
+        assert.writeOK(master.getDB("bar").baz.insert({i: i}, {writeConcern: {w: 'majority'}}));
+    }
 
-    sleep(10000);
+    // bring 2 back up, 2 should wait until caught up and then become master
+    replTest.restart(2);
+    replTest.waitForState(nodes[2], ReplSetTest.State.PRIMARY);
 
-    m2 = replTest.nodes[1].runCommand({ismaster:1})
-    assert(m2.ismaster, 'node 2 is still master');
-
-    // kill 1, 2 should become master
-    var m2Id = replTest.getNodeId(nodes[1]);
-    replTest.stop(m2Id);
-
-    sleep(10000);
-
-    m3 = replTest.nodes[2].runCommand({ismaster:1})
-    assert(m3.ismaster, 'node 3 is master');
-
-    replTest.stopSet( signal );
-}
-
-//doTest( 15 );
+    // make sure nothing was rolled back
+    master = replTest.getPrimary();
+    for (i = 0; i < 1000; i++) {
+        assert(master.getDB("foo").bar.findOne({i: i}) != null, 'checking ' + i);
+        assert(master.getDB("bar").baz.findOne({i: i}) != null, 'checking ' + i);
+    }
+}());

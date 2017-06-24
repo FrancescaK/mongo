@@ -1,1009 +1,1071 @@
-// dbclient.cpp - connect to a Mongo database as a database, from C++
-
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "pch.h"
-#include "dbclient.h"
-#include "../bson/util/builder.h"
-#include "../db/jsobj.h"
-#include "../db/json.h"
-#include "../db/dbmessage.h"
-#include "connpool.h"
-#include "dbclient_rs.h"
-#include "../util/background.h"
-#include "../util/timer.h"
-#include <fstream>
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+
+#include "mongo/platform/basic.h"
+
+#include "mongo/client/dbclient_rs.h"
+
+#include <memory>
+#include <utility>
+
+#include "mongo/bson/util/builder.h"
+#include "mongo/client/connpool.h"
+#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/global_conn_pool.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/client/replica_set_monitor.h"
+#include "mongo/client/sasl_client_authenticate.h"
+#include "mongo/db/dbmessage.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/stdx/memory.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
-    // --------------------------------
-    // ----- ReplicaSetMonitor ---------
-    // --------------------------------
+using std::shared_ptr;
+using std::unique_ptr;
+using std::endl;
+using std::map;
+using std::set;
+using std::string;
+using std::vector;
 
-    // global background job responsible for checking every X amount of time
-    class ReplicaSetMonitorWatcher : public BackgroundJob {
-    public:
-        ReplicaSetMonitorWatcher() : _safego("ReplicaSetMonitorWatcher::_safego") , _started(false) {}
+namespace {
 
-        virtual string name() const { return "ReplicaSetMonitorWatcher"; }
-        
-        void safeGo() {
-            // check outside of lock for speed
-            if ( _started )
-                return;
-            
-            scoped_lock lk( _safego );
-            if ( _started )
-                return;
-            _started = true;
+/*
+ * Set of commands that can be used with $readPreference
+ */
+set<string> _secOkCmdList;
 
-            go();
+class PopulateReadPrefSecOkCmdList {
+public:
+    PopulateReadPrefSecOkCmdList() {
+        _secOkCmdList.insert("aggregate");
+        _secOkCmdList.insert("collStats");
+        _secOkCmdList.insert("count");
+        _secOkCmdList.insert("distinct");
+        _secOkCmdList.insert("dbStats");
+        _secOkCmdList.insert("explain");
+        _secOkCmdList.insert("find");
+        _secOkCmdList.insert("geoNear");
+        _secOkCmdList.insert("geoSearch");
+        _secOkCmdList.insert("group");
+    }
+} _populateReadPrefSecOkCmdList;
+
+/**
+ * Maximum number of retries to make for auto-retry logic when performing a slave ok operation.
+ */
+const size_t MAX_RETRY = 3;
+
+/**
+ * Extracts the read preference settings from the query document. Note that this method
+ * assumes that the query is ok for secondaries so it defaults to
+ * ReadPreference::SecondaryPreferred when nothing is specified. Supports the following
+ * format:
+ *
+ * Format A (official format):
+ * { query: <actual query>, $readPreference: <read pref obj> }
+ *
+ * Format B (unofficial internal format from mongos):
+ * { <actual query>, $queryOptions: { $readPreference: <read pref obj> }}
+ *
+ * @param query the raw query document
+ *
+ * @return the read preference setting if a read preference exists, otherwise the default read
+ *         preference of Primary_Only. If the tags field was not present, it will contain one
+ *         empty tag document {} which matches any tag.
+ *
+ * @throws AssertionException if the read preference object is malformed
+ */
+std::unique_ptr<ReadPreferenceSetting> _extractReadPref(const BSONObj& query, int queryOptions) {
+    // Default read pref is primary only or secondary preferred with slaveOK
+    const auto defaultReadPref = queryOptions & QueryOption_SlaveOk
+        ? ReadPreference::SecondaryPreferred
+        : ReadPreference::PrimaryOnly;
+
+    auto readPrefContainingObj = query;
+    if (auto elem = query["$queryOptions"]) {
+        // The readPreference is embedded in the $queryOptions field.
+        readPrefContainingObj = elem.Obj();
+    }
+    return stdx::make_unique<ReadPreferenceSetting>(uassertStatusOK(
+        ReadPreferenceSetting::fromContainingBSON(readPrefContainingObj, defaultReadPref)));
+}
+
+}  // namespace
+
+// --------------------------------
+// ----- DBClientReplicaSet ---------
+// --------------------------------
+
+bool DBClientReplicaSet::_authPooledSecondaryConn = true;
+
+DBClientReplicaSet::DBClientReplicaSet(const string& name,
+                                       const vector<HostAndPort>& servers,
+                                       StringData applicationName,
+                                       double so_timeout,
+                                       MongoURI uri)
+    : _setName(name),
+      _applicationName(applicationName.toString()),
+      _so_timeout(so_timeout),
+      _uri(std::move(uri)) {
+    if (uri.isValid()) {
+        _rsm = ReplicaSetMonitor::createIfNeeded(_uri);
+    } else {
+        _rsm = ReplicaSetMonitor::createIfNeeded(name,
+                                                 set<HostAndPort>(servers.begin(), servers.end()));
+    }
+}
+
+DBClientReplicaSet::~DBClientReplicaSet() {
+    if (_lastSlaveOkConn.get() == _master.get()) {
+        _lastSlaveOkConn.release();
+    }
+}
+
+ReplicaSetMonitorPtr DBClientReplicaSet::_getMonitor() {
+    // If you can't get a ReplicaSetMonitor then this connection isn't valid
+    uassert(16340,
+            str::stream() << "No replica set monitor active and no cached seed "
+                             "found for set: "
+                          << _setName,
+            _rsm);
+    return _rsm;
+}
+
+// This can't throw an exception because it is called in the destructor of ScopedDbConnection
+string DBClientReplicaSet::getServerAddress() const {
+    if (!_rsm) {
+        warning() << "Trying to get server address for DBClientReplicaSet, but no "
+                     "ReplicaSetMonitor exists for "
+                  << _setName;
+        return str::stream() << _setName << "/";
+    }
+    return _rsm->getServerAddress();
+}
+
+HostAndPort DBClientReplicaSet::getSuspectedPrimaryHostAndPort() const {
+    if (!_master) {
+        return HostAndPort();
+    }
+    return _master->getServerHostAndPort();
+}
+
+void DBClientReplicaSet::setRequestMetadataWriter(rpc::RequestMetadataWriter writer) {
+    // Set the hooks in both our sub-connections and in ourselves.
+    if (_master) {
+        _master->setRequestMetadataWriter(writer);
+    }
+    if (_lastSlaveOkConn.get()) {
+        _lastSlaveOkConn->setRequestMetadataWriter(writer);
+    }
+    DBClientWithCommands::setRequestMetadataWriter(std::move(writer));
+}
+
+void DBClientReplicaSet::setReplyMetadataReader(rpc::ReplyMetadataReader reader) {
+    // Set the hooks in both our sub-connections and in ourselves.
+    if (_master) {
+        _master->setReplyMetadataReader(reader);
+    }
+    if (_lastSlaveOkConn.get()) {
+        _lastSlaveOkConn->setReplyMetadataReader(reader);
+    }
+    DBClientWithCommands::setReplyMetadataReader(std::move(reader));
+}
+
+int DBClientReplicaSet::getMinWireVersion() {
+    return _getMonitor()->getMinWireVersion();
+}
+
+int DBClientReplicaSet::getMaxWireVersion() {
+    return _getMonitor()->getMaxWireVersion();
+}
+
+// A replica set connection is never disconnected, since it controls its own reconnection
+// logic.
+//
+// Has the side effect of proactively clearing any cached connections which have been
+// disconnected in the background.
+bool DBClientReplicaSet::isStillConnected() {
+    if (_master && !_master->isStillConnected()) {
+        resetMaster();
+        // Don't notify monitor of bg failure, since it's not clear how long ago it happened
+    }
+
+    if (_lastSlaveOkConn.get() && !_lastSlaveOkConn->isStillConnected()) {
+        resetSlaveOkConn();
+        // Don't notify monitor of bg failure, since it's not clear how long ago it happened
+    }
+
+    return true;
+}
+
+namespace {
+
+bool _isSecondaryCommand(StringData commandName, const BSONObj& commandArgs) {
+    if (_secOkCmdList.count(commandName.toString())) {
+        return true;
+    }
+    if (commandName == "mapReduce" || commandName == "mapreduce") {
+        if (!commandArgs.hasField("out")) {
+            return false;
         }
-    protected:
-        void run() {
-            log() << "starting" << endl;
-            while ( ! inShutdown() ) {
-                sleepsecs( 10 );
-                try {
-                    ReplicaSetMonitor::checkAll( true );
-                }
-                catch ( std::exception& e ) {
-                    error() << "check failed: " << e.what() << endl;
-                }
-                catch ( ... ) {
-                    error() << "unkown error" << endl;
-                }
-            }
+
+        BSONElement outElem(commandArgs["out"]);
+        if (outElem.isABSONObj() && outElem["inline"].ok()) {
+            return true;
         }
+    }
+    return false;
+}
 
-        mongo::mutex _safego;
-        bool _started;
+// Internal implementation of isSecondaryQuery, takes previously-parsed read preference
+bool _isSecondaryQuery(const string& ns,
+                       const BSONObj& queryObj,
+                       const ReadPreferenceSetting& readPref) {
+    // If the read pref is primary only, this is not a secondary query
+    if (readPref.pref == ReadPreference::PrimaryOnly)
+        return false;
 
-    } replicaSetMonitorWatcher;
-
-    string seedString( const vector<HostAndPort>& servers ){
-        string seedStr;
-        for ( unsigned i = 0; i < servers.size(); i++ ){
-            seedStr += servers[i].toString();
-            if( i < servers.size() - 1 ) seedStr += ",";
-        }
-
-        return seedStr;
+    if (ns.find(".$cmd") == string::npos) {
+        return true;
     }
 
-    ReplicaSetMonitor::ReplicaSetMonitor( const string& name , const vector<HostAndPort>& servers )
-        : _lock( "ReplicaSetMonitor instance" ) , _checkConnectionLock( "ReplicaSetMonitor check connection lock" ), _name( name ) , _master(-1), _nextSlave(0) {
-        
-        uassert( 13642 , "need at least 1 node for a replica set" , servers.size() > 0 );
+    // This is a command with secondary-possible read pref
+    // Only certain commands are supported for secondary operation.
 
-        if ( _name.size() == 0 ) {
-            warning() << "replica set name empty, first node: " << servers[0] << endl;
-        }
-
-        log() << "starting new replica set monitor for replica set " << _name << " with seed of " << seedString( servers ) << endl;
-
-        string errmsg;
-        for ( unsigned i = 0; i < servers.size(); i++ ) {
-
-            // Don't check servers we have already
-            if( _find_inlock( servers[i] ) >= 0 ) continue;
-
-            auto_ptr<DBClientConnection> conn( new DBClientConnection( true , 0, 5.0 ) );
-            try{
-                if( ! conn->connect( servers[i] , errmsg ) ){
-                    throw DBException( errmsg, 15928 );
-                }
-                log() << "successfully connected to seed " << servers[i] << " for replica set " << this->_name << endl;
-            }
-            catch( DBException& e ){
-                log() << "error connecting to seed " << servers[i] << causedBy( e ) << endl;
-                // skip seeds that don't work
-                continue;
-            }
-
-            string maybePrimary;
-            _checkConnection( conn.get(), maybePrimary, false, -1 );
-        }
-
-        // Check everything to get the first data
-        _check( true );
-
-        log() << "replica set monitor for replica set " << _name << " started, address is " << getServerAddress() << endl;
-
+    BSONObj actualQueryObj;
+    if (strcmp(queryObj.firstElement().fieldName(), "$query") == 0) {
+        actualQueryObj = queryObj["$query"].embeddedObject();
+    } else if (strcmp(queryObj.firstElement().fieldName(), "query") == 0) {
+        actualQueryObj = queryObj["query"].embeddedObject();
+    } else {
+        actualQueryObj = queryObj;
     }
 
-    ReplicaSetMonitor::~ReplicaSetMonitor() {
-        _nodes.clear();
-        _master = -1;
+    StringData commandName = actualQueryObj.firstElementFieldName();
+    return _isSecondaryCommand(commandName, actualQueryObj);
+}
+
+}  // namespace
+
+
+bool DBClientReplicaSet::isSecondaryQuery(const string& ns,
+                                          const BSONObj& queryObj,
+                                          int queryOptions) {
+    unique_ptr<ReadPreferenceSetting> readPref(_extractReadPref(queryObj, queryOptions));
+    return _isSecondaryQuery(ns, queryObj, *readPref);
+}
+
+DBClientConnection* DBClientReplicaSet::checkMaster() {
+    ReplicaSetMonitorPtr monitor = _getMonitor();
+    HostAndPort h = monitor->getMasterOrUassert();
+
+    if (h == _masterHost && _master) {
+        // a master is selected.  let's just make sure connection didn't die
+        if (!_master->isFailed())
+            return _master.get();
+
+        monitor->failedHost(
+            _masterHost, {ErrorCodes::fromInt(40332), "Last known master host cannot be reached"});
+        h = monitor->getMasterOrUassert();  // old master failed, try again.
     }
 
-    ReplicaSetMonitorPtr ReplicaSetMonitor::get( const string& name , const vector<HostAndPort>& servers ) {
-        scoped_lock lk( _setsLock );
-        ReplicaSetMonitorPtr& m = _sets[name];
-        if ( ! m )
-            m.reset( new ReplicaSetMonitor( name , servers ) );
+    _masterHost = h;
 
-        replicaSetMonitorWatcher.safeGo();
+    MongoURI masterUri;
+    if (!_uri.isValid())
+        masterUri = MongoURI(ConnectionString(_masterHost));
+    else
+        masterUri = _uri.cloneURIForServer(_masterHost);
 
-        return m;
+    string errmsg;
+    DBClientConnection* newConn = NULL;
+    boost::optional<double> socketTimeout;
+    if (_so_timeout > 0.0)
+        socketTimeout = _so_timeout;
+
+    try {
+        // Needs to perform a dynamic_cast because we need to set the replSet
+        // callback. We should eventually not need this after we remove the
+        // callback.
+        newConn = dynamic_cast<DBClientConnection*>(
+            masterUri.connect(_applicationName, errmsg, socketTimeout));
+    } catch (const AssertionException& ex) {
+        errmsg = ex.toString();
     }
 
-    ReplicaSetMonitorPtr ReplicaSetMonitor::get( const string& name ) {
-        scoped_lock lk( _setsLock );
-        map<string,ReplicaSetMonitorPtr>::const_iterator i = _sets.find( name );
-        if ( i == _sets.end() ) 
-            return ReplicaSetMonitorPtr();
-        return i->second;
+    if (newConn == NULL || !errmsg.empty()) {
+        const std::string message = str::stream() << "can't connect to new replica set master ["
+                                                  << _masterHost.toString() << "]"
+                                                  << (errmsg.empty() ? "" : ", err: ") << errmsg;
+        monitor->failedHost(_masterHost, {ErrorCodes::fromInt(40333), message});
+        uasserted(ErrorCodes::FailedToSatisfyReadPreference, message);
     }
 
+    resetMaster();
 
-    void ReplicaSetMonitor::checkAll( bool checkAllSecondaries ) {
-        set<string> seen;
+    _masterHost = h;
+    _master.reset(newConn);
+    _master->setParentReplSetName(_setName);
+    _master->setRequestMetadataWriter(getRequestMetadataWriter());
+    _master->setReplyMetadataReader(getReplyMetadataReader());
 
-        while ( true ) {
-            ReplicaSetMonitorPtr m;
-            {
-                scoped_lock lk( _setsLock );
-                for ( map<string,ReplicaSetMonitorPtr>::iterator i=_sets.begin(); i!=_sets.end(); ++i ) {
-                    string name = i->first;
-                    if ( seen.count( name ) )
-                        continue;
-                    LOG(1) << "checking replica set: " << name << endl;
-                    seen.insert( name );
-                    m = i->second;
-                    break;
-                }
-            }
+    _authConnection(_master.get());
+    return _master.get();
+}
 
-            if ( ! m )
-                break;
-
-            m->check( checkAllSecondaries );
-        }
-
-
-    }
-
-    void ReplicaSetMonitor::setConfigChangeHook( ConfigChangeHook hook ) {
-        massert( 13610 , "ConfigChangeHook already specified" , _hook == 0 );
-        _hook = hook;
-    }
-    
-    string ReplicaSetMonitor::getServerAddress() const {
-        scoped_lock lk( _lock );
-        return _getServerAddress_inlock();
-    }
-
-    string ReplicaSetMonitor::_getServerAddress_inlock() const {
-        StringBuilder ss;
-        if ( _name.size() )
-            ss << _name << "/";
-
-        for ( unsigned i=0; i<_nodes.size(); i++ ) {
-            if ( i > 0 )
-                ss << ",";
-            ss << _nodes[i].addr.toString();
-        }
-
-        return ss.str();
-    }
-
-    bool ReplicaSetMonitor::contains( const string& server ) const {
-        scoped_lock lk( _lock );
-        for ( unsigned i=0; i<_nodes.size(); i++ ) {
-            if ( _nodes[i].addr == server )
-                return true;
-        }
+bool DBClientReplicaSet::checkLastHost(const ReadPreferenceSetting* readPref) {
+    // Can't use a cached host if we don't have one.
+    if (!_lastSlaveOkConn.get() || _lastSlaveOkHost.empty()) {
         return false;
     }
-    
 
-    void ReplicaSetMonitor::notifyFailure( const HostAndPort& server ) {
-        scoped_lock lk( _lock );
-        if ( _master >= 0 && _master < (int)_nodes.size() ) {
-            if ( server == _nodes[_master].addr ) {
-                _nodes[_master].ok = false; 
-                _master = -1;
-            }
-        }
+    // Don't pin if the readPrefs differ.
+    if (!_lastReadPref || !_lastReadPref->equals(*readPref)) {
+        return false;
     }
 
-
-
-    HostAndPort ReplicaSetMonitor::getMaster() {
-        {
-            scoped_lock lk( _lock );
-            if ( _master >= 0 && _nodes[_master].ok )
-                return _nodes[_master].addr;
-        }
-        
-        _check( false );
-
-        scoped_lock lk( _lock );
-        uassert( 10009 , str::stream() << "ReplicaSetMonitor no master found for set: " << _name , _master >= 0 );
-        return _nodes[_master].addr;
+    // Make sure we don't think the host is down.
+    if (_lastSlaveOkConn->isFailed() || !_getMonitor()->isHostUp(_lastSlaveOkHost)) {
+        _invalidateLastSlaveOkCache(
+            {ErrorCodes::fromInt(40334), "Last slave connection is no longer available"});
+        return false;
     }
-    
-    HostAndPort ReplicaSetMonitor::getSlave( const HostAndPort& prev ) {
-        // make sure its valid
 
-        bool wasFound = false;
-        bool wasMaster = false;
+    return true;
+}
 
-        // This is always true, since checked in port()
-        assert( prev.port() >= 0 );
-        if( prev.host().size() ){
-            scoped_lock lk( _lock );
-            for ( unsigned i=0; i<_nodes.size(); i++ ) {
-                if ( prev != _nodes[i].addr ) 
-                    continue;
+void DBClientReplicaSet::_authConnection(DBClientConnection* conn) {
+    for (map<string, BSONObj>::const_iterator i = _auths.begin(); i != _auths.end(); ++i) {
+        try {
+            conn->auth(i->second);
+        } catch (const UserException&) {
+            warning() << "cached auth failed for set: " << _setName
+                      << " db: " << i->second[saslCommandUserDBFieldName].str()
+                      << " user: " << i->second[saslCommandUserFieldName].str() << endl;
+        }
+    }
+}
 
-                wasFound = true;
+void DBClientReplicaSet::logoutAll(DBClientConnection* conn) {
+    for (map<string, BSONObj>::const_iterator i = _auths.begin(); i != _auths.end(); ++i) {
+        BSONObj response;
+        try {
+            conn->logout(i->first, response);
+        } catch (const UserException& ex) {
+            warning() << "Failed to logout: " << conn->getServerAddress() << " on db: " << i->first
+                      << causedBy(redact(ex));
+        }
+    }
+}
 
-                if ( _nodes[i].okForSecondaryQueries() )
-                    return prev;
+DBClientConnection& DBClientReplicaSet::masterConn() {
+    return *checkMaster();
+}
 
-                wasMaster = _nodes[i].ok && ! _nodes[i].secondary;
+DBClientConnection& DBClientReplicaSet::slaveConn() {
+    shared_ptr<ReadPreferenceSetting> readPref(
+        new ReadPreferenceSetting(ReadPreference::SecondaryPreferred, TagSet()));
+    DBClientConnection* conn = selectNodeUsingTags(readPref);
 
+    uassert(16369,
+            str::stream() << "No good nodes available for set: " << _getMonitor()->getName(),
+            conn != NULL);
+
+    return *conn;
+}
+
+bool DBClientReplicaSet::connect() {
+    // Returns true if there are any up hosts.
+    const ReadPreferenceSetting anyUpHost(ReadPreference::Nearest, TagSet());
+    return _getMonitor()->getHostOrRefresh(anyUpHost).isOK();
+}
+
+static bool isAuthenticationException(const DBException& ex) {
+    return ex.getCode() == ErrorCodes::AuthenticationFailed;
+}
+
+void DBClientReplicaSet::_auth(const BSONObj& params) {
+    // We prefer to authenticate against a primary, but otherwise a secondary is ok too
+    // Empty tag matches every secondary
+    shared_ptr<ReadPreferenceSetting> readPref(
+        new ReadPreferenceSetting(ReadPreference::PrimaryPreferred, TagSet()));
+
+    LOG(3) << "dbclient_rs authentication of " << _getMonitor()->getName() << endl;
+
+    // NOTE that we retry MAX_RETRY + 1 times, since we're always primary preferred we don't
+    // fallback to the primary.
+    Status lastNodeStatus = Status::OK();
+    for (size_t retry = 0; retry < MAX_RETRY + 1; retry++) {
+        try {
+            DBClientConnection* conn = selectNodeUsingTags(readPref);
+
+            if (conn == NULL) {
                 break;
             }
-        }
-        
-        if( prev.host().size() ){
-            if( wasFound ){ LOG(1) << "slave '" << prev << ( wasMaster ? "' is master node, trying to find another node" :
-                                                                         "' is no longer ok to use" ) << endl; }
-            else{ LOG(1) << "slave '" << prev << "' was not found in the replica set" << endl; }
-        }
-        else LOG(1) << "slave '" << prev << "' is not initialized or invalid" << endl;
 
-        return getSlave();
-    }
+            conn->auth(params);
 
-    HostAndPort ReplicaSetMonitor::getSlave() {
-        LOG(2) << "dbclient_rs getSlave " << getServerAddress() << endl;
+            // Cache the new auth information since we now validated it's good
+            _auths[params[saslCommandUserDBFieldName].str()] = params.getOwned();
 
-        scoped_lock lk( _lock );
-
-        for ( unsigned ii = 0; ii < _nodes.size(); ii++ ) {
-            _nextSlave = ( _nextSlave + 1 ) % _nodes.size();
-            if ( _nextSlave != _master ) {
-                if ( _nodes[ _nextSlave ].okForSecondaryQueries() )
-                    return _nodes[ _nextSlave ].addr;
-                LOG(2) << "dbclient_rs getSlave not selecting " << _nodes[_nextSlave] << ", not currently okForSecondaryQueries" << endl;
+            // Ensure the only child connection open is the one we authenticated against - other
+            // child connections may not have full authentication information.
+            // NOTE: _lastSlaveOkConn may or may not be the same as _master
+            dassert(_lastSlaveOkConn.get() == conn || _master.get() == conn);
+            if (conn != _lastSlaveOkConn.get()) {
+                resetSlaveOkConn();
             }
-        }
-        uassert(15899, str::stream() << "No suitable member found for slaveOk query in replica set: " << _name, _master >= 0 && _nodes[_master].ok);
+            if (conn != _master.get()) {
+                resetMaster();
+            }
 
-        // Fall back to primary
-        assert( static_cast<unsigned>(_master) < _nodes.size() );
-        LOG(2) << "dbclient_rs getSlave no member in secondary state found, returning primary " << _nodes[ _master ] << endl;
-        return _nodes[_master].addr;
+            return;
+        } catch (const DBException& ex) {
+            // We care if we can't authenticate (i.e. bad password) in credential params.
+            if (isAuthenticationException(ex)) {
+                throw;
+            }
+
+            const Status status = ex.toStatus();
+            lastNodeStatus = {status.code(),
+                              str::stream() << "can't authenticate against replica set node "
+                                            << _lastSlaveOkHost
+                                            << ": "
+                                            << status.reason()};
+            _invalidateLastSlaveOkCache(lastNodeStatus);
+        }
     }
 
-    /**
-     * notify the monitor that server has faild
+    if (lastNodeStatus.isOK()) {
+        StringBuilder assertMsgB;
+        assertMsgB << "Failed to authenticate, no good nodes in " << _getMonitor()->getName();
+        uasserted(ErrorCodes::NodeNotFound, assertMsgB.str());
+    } else {
+        uasserted(lastNodeStatus.code(), lastNodeStatus.reason());
+    }
+}
+
+void DBClientReplicaSet::logout(const string& dbname, BSONObj& info) {
+    DBClientConnection* priConn = checkMaster();
+
+    priConn->logout(dbname, info);
+    _auths.erase(dbname);
+
+    /* Also logout the cached secondary connection. Note that this is only
+     * needed when we actually have something cached and is last known to be
+     * working.
      */
-    void ReplicaSetMonitor::notifySlaveFailure( const HostAndPort& server ) {
-        int x = _find( server );
-        if ( x >= 0 ) {
-            scoped_lock lk( _lock );
-            _nodes[x].ok = false;
-        }
-    }
-
-    void ReplicaSetMonitor::_checkStatus(DBClientConnection *conn) {
-        BSONObj status;
-
-        if (!conn->runCommand("admin", BSON("replSetGetStatus" << 1), status) ) {
-            LOG(1) << "dbclient_rs replSetGetStatus failed" << endl;
-            return;
-        }
-        if( !status.hasField("members") ) { 
-            log() << "dbclient_rs error expected members field in replSetGetStatus result" << endl;
-            return;
-        }
-        if( status["members"].type() != Array) {
-            log() << "dbclient_rs error expected members field in replSetGetStatus result to be an array" << endl;
-            return;
-        }
-
-        BSONObjIterator hi(status["members"].Obj());
-        while (hi.more()) {
-            BSONObj member = hi.next().Obj();
-            string host = member["name"].String();
-
-            int m = -1;
-            if ((m = _find(host)) < 0) {
-                LOG(1) << "dbclient_rs _checkStatus couldn't _find(" << host << ')' << endl;
-                continue;
-            }
-
-            double state = member["state"].Number();
-            if (member["health"].Number() == 1 && (state == 1 || state == 2)) {
-                LOG(1) << "dbclient_rs nodes["<<m<<"].ok = true " << host << endl;
-                scoped_lock lk( _lock );
-                _nodes[m].ok = true;
-            }
-            else {
-                LOG(1) << "dbclient_rs nodes["<<m<<"].ok = false " << host << endl;
-                scoped_lock lk( _lock );
-                _nodes[m].ok = false;
-            }
-        }
-    }
-
-    NodeDiff ReplicaSetMonitor::_getHostDiff_inlock( const BSONObj& hostList ){
-
-        NodeDiff diff;
-        set<int> nodesFound;
-
-        int index = 0;
-        BSONObjIterator hi( hostList );
-        while( hi.more() ){
-
-            string toCheck = hi.next().String();
-            int nodeIndex = _find_inlock( toCheck );
-
-            // Node-to-add
-            if( nodeIndex < 0 ) diff.first.insert( toCheck );
-            else nodesFound.insert( nodeIndex );
-
-            index++;
-        }
-
-        for( size_t i = 0; i < _nodes.size(); i++ ){
-            if( nodesFound.find( static_cast<int>(i) ) == nodesFound.end() ) diff.second.insert( static_cast<int>(i) );
-        }
-
-        return diff;
-    }
-
-    bool ReplicaSetMonitor::_shouldChangeHosts( const BSONObj& hostList, bool inlock ){
-
-        int origHosts = 0;
-        if( ! inlock ){
-            scoped_lock lk( _lock );
-            origHosts = _nodes.size();
-        }
-        else origHosts = _nodes.size();
-        int numHosts = 0;
-        bool changed = false;
-
-        BSONObjIterator hi(hostList);
-        while ( hi.more() ) {
-            string toCheck = hi.next().String();
-
-            numHosts++;
-            int index = 0;
-            if( ! inlock ) index = _find( toCheck );
-            else index = _find_inlock( toCheck );
-
-            if ( index >= 0 ) continue;
-
-            changed = true;
-            break;
-        }
-
-        return changed || origHosts != numHosts;
-
-    }
-
-    void ReplicaSetMonitor::_checkHosts( const BSONObj& hostList, bool& changed ) {
-
-        // Fast path, still requires intermittent locking
-        if( ! _shouldChangeHosts( hostList, false ) ){
-            changed = false;
-            return;
-        }
-
-        // Slow path, double-checked though
-        scoped_lock lk( _lock );
-
-        // Our host list may have changed while waiting for another thread in the meantime,
-        // so double-check here
-        // TODO:  Do we really need this much protection, this should be pretty rare and not triggered
-        // from lots of threads, duping old behavior for safety
-        if( ! _shouldChangeHosts( hostList, true ) ){
-            changed = false;
-            return;
-        }
-
-        // LogLevel can be pretty low, since replica set reconfiguration should be pretty rare and we
-        // want to record our changes
-        log() << "changing hosts to " << hostList << " from " << _getServerAddress_inlock() << endl;
-
-        NodeDiff diff = _getHostDiff_inlock( hostList );
-        set<string> added = diff.first;
-        set<int> removed = diff.second;
-
-        assert( added.size() > 0 || removed.size() > 0 );
-        changed = true;
-
-        // Delete from the end so we don't invalidate as we delete, delete indices are ascending
-        for( set<int>::reverse_iterator i = removed.rbegin(), end = removed.rend(); i != end; ++i ){
-
-            log() << "erasing host " << _nodes[ *i ] << " from replica set " << this->_name << endl;
-
-            _nodes.erase( _nodes.begin() + *i );
-        }
-
-        // Add new nodes
-        for( set<string>::iterator i = added.begin(), end = added.end(); i != end; ++i ){
-
-            log() << "trying to add new host " << *i << " to replica set " << this->_name << endl;
-
-            // Connect to new node
-            HostAndPort h( *i );
-            DBClientConnection * newConn = new DBClientConnection( true, 0, 5.0 );
-
-            string errmsg;
-            try{
-                if( ! newConn->connect( h , errmsg ) ){
-                    throw DBException( errmsg, 15927 );
-                }
-                log() << "successfully connected to new host " << *i << " in replica set " << this->_name << endl;
-            }
-            catch( DBException& e ){
-                warning() << "cannot connect to new host " << *i << " to replica set " << this->_name << causedBy( e ) << endl;
-            }
-
-            _nodes.push_back( Node( h , newConn ) );
-        }
-
-    }
-    
-    
-
-    bool ReplicaSetMonitor::_checkConnection( DBClientConnection * c , string& maybePrimary , bool verbose , int nodesOffset ) {
-        assert( c );
-        scoped_lock lk( _checkConnectionLock );
-        bool isMaster = false;
-        bool changed = false;
+    if (_lastSlaveOkConn.get() != NULL && !_lastSlaveOkConn->isFailed()) {
         try {
-            Timer t;
-            BSONObj o;
-            c->isMaster(isMaster, &o);
-            if ( o["setName"].type() != String || o["setName"].String() != _name ) {
-                warning() << "node: " << c->getServerAddress() << " isn't a part of set: " << _name 
-                          << " ismaster: " << o << endl;
-                if ( nodesOffset >= 0 )
-                    _nodes[nodesOffset].ok = false;
-                return false;
-            }
-
-            if ( nodesOffset >= 0 ) {
-                _nodes[nodesOffset].pingTimeMillis = t.millis();
-                _nodes[nodesOffset].hidden = o["hidden"].trueValue();
-                _nodes[nodesOffset].secondary = o["secondary"].trueValue();
-                _nodes[nodesOffset].ismaster = o["ismaster"].trueValue();
-
-                _nodes[nodesOffset].lastIsMaster = o.copy();
-            }
-
-            log( ! verbose ) << "ReplicaSetMonitor::_checkConnection: " << c->toString() << ' ' << o << endl;
-            
-            // add other nodes
-            BSONArrayBuilder b;
-            if ( o["hosts"].type() == Array ) {
-                if ( o["primary"].type() == String )
-                    maybePrimary = o["primary"].String();
-
-                BSONObjIterator it( o["hosts"].Obj() );
-                while( it.more() ) b.append( it.next() );
-            }
-            if (o.hasField("passives") && o["passives"].type() == Array) {
-                BSONObjIterator it( o["passives"].Obj() );
-                while( it.more() ) b.append( it.next() );
-            }
-            
-            _checkHosts( b.arr(), changed);
-            _checkStatus(c);
-
-            
+            BSONObj dummy;
+            _lastSlaveOkConn->logout(dbname, dummy);
+        } catch (const DBException&) {
+            // Make sure we can't use this connection again.
+            verify(_lastSlaveOkConn->isFailed());
         }
-        catch ( std::exception& e ) {
-            log( ! verbose ) << "ReplicaSetMonitor::_checkConnection: caught exception " << c->toString() << ' ' << e.what() << endl;
-            _nodes[nodesOffset].ok = false;
-        }
-
-        if ( changed && _hook )
-            _hook( this );
-
-        return isMaster;
     }
+}
 
-    void ReplicaSetMonitor::_check( bool checkAllSecondaries ) {
+// ------------- simple functions -----------------
 
-        bool triedQuickCheck = false;
+void DBClientReplicaSet::insert(const string& ns, BSONObj obj, int flags) {
+    checkMaster()->insert(ns, obj, flags);
+}
 
-        LOG(1) <<  "_check : " << getServerAddress() << endl;
+void DBClientReplicaSet::insert(const string& ns, const vector<BSONObj>& v, int flags) {
+    checkMaster()->insert(ns, v, flags);
+}
 
-        int newMaster = -1;
-        
-        for ( int retry = 0; retry < 2; retry++ ) {
-            for ( unsigned i=0; i<_nodes.size(); i++ ) {
-                shared_ptr<DBClientConnection> c;
-                {
-                    scoped_lock lk( _lock );
-                    c = _nodes[i].conn;
+void DBClientReplicaSet::remove(const string& ns, Query obj, int flags) {
+    checkMaster()->remove(ns, obj, flags);
+}
+
+void DBClientReplicaSet::update(const string& ns, Query query, BSONObj obj, int flags) {
+    return checkMaster()->update(ns, query, obj, flags);
+}
+
+unique_ptr<DBClientCursor> DBClientReplicaSet::query(const string& ns,
+                                                     Query query,
+                                                     int nToReturn,
+                                                     int nToSkip,
+                                                     const BSONObj* fieldsToReturn,
+                                                     int queryOptions,
+                                                     int batchSize) {
+    shared_ptr<ReadPreferenceSetting> readPref(_extractReadPref(query.obj, queryOptions));
+    if (_isSecondaryQuery(ns, query.obj, *readPref)) {
+        LOG(3) << "dbclient_rs query using secondary or tagged node selection in "
+               << _getMonitor()->getName() << ", read pref is " << readPref->toString()
+               << " (primary : "
+               << (_master.get() != NULL ? _master->getServerAddress() : "[not cached]")
+               << ", lastTagged : " << (_lastSlaveOkConn.get() != NULL
+                                            ? _lastSlaveOkConn->getServerAddress()
+                                            : "[not cached]")
+               << ")" << endl;
+
+        string lastNodeErrMsg;
+
+        for (size_t retry = 0; retry < MAX_RETRY; retry++) {
+            try {
+                DBClientConnection* conn = selectNodeUsingTags(readPref);
+
+                if (conn == NULL) {
+                    break;
                 }
 
-                string maybePrimary;
-                if ( _checkConnection( c.get() , maybePrimary , retry , i ) ) {
-                    _master = i;
-                    newMaster = i;
-                    if ( ! checkAllSecondaries )
-                        return;
-                }
+                unique_ptr<DBClientCursor> cursor = conn->query(
+                    ns, query, nToReturn, nToSkip, fieldsToReturn, queryOptions, batchSize);
 
-                if ( ! triedQuickCheck && maybePrimary.size() ) {
-                    int x = _find( maybePrimary );
-                    if ( x >= 0 ) {
-                        triedQuickCheck = true;
-                        string dummy;
-                        shared_ptr<DBClientConnection> testConn;
-                        {
-                            scoped_lock lk( _lock );
-                            testConn = _nodes[x].conn;
-                        }
-                        if ( _checkConnection( testConn.get() , dummy , false , x ) ) {
-                            _master = x;
-                            newMaster = x;
-                            if ( ! checkAllSecondaries )
-                                return;
-                        }
-                    }
-                }
-
-            }
-            
-            if ( newMaster >= 0 )
-                return;
-
-            sleepsecs(1);
-        }
-
-    }
-
-    void ReplicaSetMonitor::check( bool checkAllSecondaries ) {
-        // first see if the current master is fine
-        if ( _master >= 0 ) {
-            string temp;
-            if ( _checkConnection( _nodes[_master].conn.get() , temp , false , _master ) ) {
-                if ( ! checkAllSecondaries ) {
-                    // current master is fine, so we're done
-                    return;
-                }
+                return checkSlaveQueryResult(std::move(cursor));
+            } catch (const DBException& ex) {
+                const Status status = ex.toStatus();
+                lastNodeErrMsg = str::stream() << "can't query replica set node "
+                                               << _lastSlaveOkHost << ": " << status.reason();
+                _invalidateLastSlaveOkCache({status.code(), lastNodeErrMsg});
             }
         }
 
-        // we either have no master, or the current is dead
-        _check( checkAllSecondaries );
-    }
-
-    int ReplicaSetMonitor::_find( const string& server ) const {
-        scoped_lock lk( _lock );
-        return _find_inlock( server );
-    }
-
-    int ReplicaSetMonitor::_find_inlock( const string& server ) const {
-        for ( unsigned i=0; i<_nodes.size(); i++ )
-            if ( _nodes[i].addr == server )
-                return i;
-        return -1;
-    }
-
-
-    int ReplicaSetMonitor::_find( const HostAndPort& server ) const {
-        scoped_lock lk( _lock );
-        for ( unsigned i=0; i<_nodes.size(); i++ )
-            if ( _nodes[i].addr == server )
-                return i;
-        return -1;
-    }
-    
-    void ReplicaSetMonitor::appendInfo( BSONObjBuilder& b ) const {
-        scoped_lock lk( _lock );
-        BSONArrayBuilder hosts( b.subarrayStart( "hosts" ) );
-        for ( unsigned i=0; i<_nodes.size(); i++ ) {
-            hosts.append( BSON( "addr" << _nodes[i].addr <<
-                                // "lastIsMaster" << _nodes[i].lastIsMaster << // this is a potential race, so only used when debugging
-                                "ok" << _nodes[i].ok <<
-                                "ismaster" << _nodes[i].ismaster <<
-                                "hidden" << _nodes[i].hidden <<
-                                "secondary" << _nodes[i].secondary <<
-                                "pingTimeMillis" << _nodes[i].pingTimeMillis  ) );
-            
-        }
-        hosts.done();
-        
-        b.append( "master" , _master );
-        b.append( "nextSlave" , _nextSlave );
-    }
-    
-
-    mongo::mutex ReplicaSetMonitor::_setsLock( "ReplicaSetMonitor" );
-    map<string,ReplicaSetMonitorPtr> ReplicaSetMonitor::_sets;
-    ReplicaSetMonitor::ConfigChangeHook ReplicaSetMonitor::_hook;
-    // --------------------------------
-    // ----- DBClientReplicaSet ---------
-    // --------------------------------
-
-    DBClientReplicaSet::DBClientReplicaSet( const string& name , const vector<HostAndPort>& servers, double so_timeout )
-        : _monitor( ReplicaSetMonitor::get( name , servers ) ),
-          _so_timeout( so_timeout ) {
-    }
-
-    DBClientReplicaSet::~DBClientReplicaSet() {
-    }
-
-    DBClientConnection * DBClientReplicaSet::checkMaster() {
-        HostAndPort h = _monitor->getMaster();
-
-        if ( h == _masterHost && _master ) {
-            // a master is selected.  let's just make sure connection didn't die
-            if ( ! _master->isFailed() )
-                return _master.get();
-            _monitor->notifyFailure( _masterHost );
+        StringBuilder assertMsg;
+        assertMsg << "Failed to do query, no good nodes in " << _getMonitor()->getName();
+        if (!lastNodeErrMsg.empty()) {
+            assertMsg << ", last error: " << lastNodeErrMsg;
         }
 
-        _masterHost = _monitor->getMaster();
-        _master.reset( new DBClientConnection( true , this , _so_timeout ) );
-        string errmsg;
-        if ( ! _master->connect( _masterHost , errmsg ) ) {
-            _monitor->notifyFailure( _masterHost );
-            uasserted( 13639 , str::stream() << "can't connect to new replica set master [" << _masterHost.toString() << "] err: " << errmsg );
+        uasserted(16370, assertMsg.str());
+    }
+
+    LOG(3) << "dbclient_rs query to primary node in " << _getMonitor()->getName() << endl;
+
+    return checkMaster()->query(
+        ns, query, nToReturn, nToSkip, fieldsToReturn, queryOptions, batchSize);
+}
+
+BSONObj DBClientReplicaSet::findOne(const string& ns,
+                                    const Query& query,
+                                    const BSONObj* fieldsToReturn,
+                                    int queryOptions) {
+    shared_ptr<ReadPreferenceSetting> readPref(_extractReadPref(query.obj, queryOptions));
+    if (_isSecondaryQuery(ns, query.obj, *readPref)) {
+        LOG(3) << "dbclient_rs findOne using secondary or tagged node selection in "
+               << _getMonitor()->getName() << ", read pref is " << readPref->toString()
+               << " (primary : "
+               << (_master.get() != NULL ? _master->getServerAddress() : "[not cached]")
+               << ", lastTagged : " << (_lastSlaveOkConn.get() != NULL
+                                            ? _lastSlaveOkConn->getServerAddress()
+                                            : "[not cached]")
+               << ")" << endl;
+
+        string lastNodeErrMsg;
+
+        for (size_t retry = 0; retry < MAX_RETRY; retry++) {
+            try {
+                DBClientConnection* conn = selectNodeUsingTags(readPref);
+
+                if (conn == NULL) {
+                    break;
+                }
+
+                return conn->findOne(ns, query, fieldsToReturn, queryOptions);
+            } catch (const DBException& ex) {
+                const Status status = ex.toStatus();
+                lastNodeErrMsg = str::stream() << "can't findone replica set node "
+                                               << _lastSlaveOkHost.toString() << ": "
+                                               << status.reason();
+                _invalidateLastSlaveOkCache({status.code(), lastNodeErrMsg});
+            }
         }
-        _auth( _master.get() );
+
+        StringBuilder assertMsg;
+        assertMsg << "Failed to call findOne, no good nodes in " << _getMonitor()->getName();
+        if (!lastNodeErrMsg.empty()) {
+            assertMsg << ", last error: " << lastNodeErrMsg;
+        }
+
+        uasserted(16379, assertMsg.str());
+    }
+
+    LOG(3) << "dbclient_rs findOne to primary node in " << _getMonitor()->getName() << endl;
+
+    return checkMaster()->findOne(ns, query, fieldsToReturn, queryOptions);
+}
+
+void DBClientReplicaSet::killCursor(long long cursorID) {
+    // we should never call killCursor on a replica set connection
+    // since we don't know which server it belongs to
+    // can't assume master because of slave ok
+    // and can have a cursor survive a master change
+    verify(0);
+}
+
+void DBClientReplicaSet::isntMaster() {
+    // Can't use _getMonitor because that will create a new monitor from the cached seed if the
+    // monitor doesn't exist.
+    _rsm->failedHost(
+        _masterHost,
+        {ErrorCodes::NotMaster, str::stream() << "got not master for: " << _masterHost});
+
+    resetMaster();
+}
+
+unique_ptr<DBClientCursor> DBClientReplicaSet::checkSlaveQueryResult(
+    unique_ptr<DBClientCursor> result) {
+    if (result.get() == NULL)
+        return result;
+
+    BSONObj error;
+    bool isError = result->peekError(&error);
+    if (!isError)
+        return result;
+
+    // We only check for "not master or secondary" errors here
+
+    // If the error code here ever changes, we need to change this code also
+    BSONElement code = error["code"];
+    if (code.isNumber() && code.Int() == ErrorCodes::NotMasterOrSecondary) {
+        isntSecondary();
+        throw DBException(str::stream() << "slave " << _lastSlaveOkHost.toString()
+                                        << " is no longer secondary",
+                          14812);
+    }
+
+    return result;
+}
+
+void DBClientReplicaSet::isntSecondary() {
+    // Failover to next slave
+    _getMonitor()->failedHost(
+        _lastSlaveOkHost,
+        {ErrorCodes::NotMasterOrSecondary,
+         str::stream() << "slave no longer has secondary status: " << _lastSlaveOkHost});
+
+    resetSlaveOkConn();
+}
+
+DBClientConnection* DBClientReplicaSet::selectNodeUsingTags(
+    shared_ptr<ReadPreferenceSetting> readPref) {
+    if (checkLastHost(readPref.get())) {
+        LOG(3) << "dbclient_rs selecting compatible last used node " << _lastSlaveOkHost;
+
+        return _lastSlaveOkConn.get();
+    }
+
+    ReplicaSetMonitorPtr monitor = _getMonitor();
+
+    auto selectedNodeStatus = monitor->getHostOrRefresh(*readPref);
+    if (!selectedNodeStatus.isOK()) {
+        LOG(3) << "dbclient_rs no compatible node found"
+               << causedBy(redact(selectedNodeStatus.getStatus()));
+        return nullptr;
+    }
+
+    const HostAndPort selectedNode = std::move(selectedNodeStatus.getValue());
+
+    // We are now about to get a new connection from the pool, so cleanup
+    // the current one and release it back to the pool.
+    resetSlaveOkConn();
+
+    _lastReadPref = readPref;
+    _lastSlaveOkHost = selectedNode;
+
+    // Primary connection is special because it is the only connection that is
+    // versioned in mongos. Therefore, we have to make sure that this object
+    // maintains only one connection to the primary and use that connection
+    // every time we need to talk to the primary.
+    if (monitor->isPrimary(selectedNode)) {
+        checkMaster();
+
+        LOG(3) << "dbclient_rs selecting primary node " << selectedNode << endl;
+
+        _lastSlaveOkConn.reset(_master.get());
+
         return _master.get();
     }
 
-    DBClientConnection * DBClientReplicaSet::checkSlave() {
-        HostAndPort h = _monitor->getSlave( _slaveHost );
+    // Needs to perform a dynamic_cast because we need to set the replSet
+    // callback. We should eventually not need this after we remove the
+    // callback.
+    DBClientConnection* newConn = dynamic_cast<DBClientConnection*>(
+        globalConnPool.get(_lastSlaveOkHost.toString(), _so_timeout));
 
-        if ( h == _slaveHost && _slave ) {
-            if ( ! _slave->isFailed() )
-                return _slave.get();
-            _monitor->notifySlaveFailure( _slaveHost );
-            _slaveHost = _monitor->getSlave();
-        } 
-        else {
-            _slaveHost = h;
-        }
+    // Assert here instead of returning NULL since the contract of this method is such
+    // that returning NULL means none of the nodes were good, which is not the case here.
+    uassert(16532,
+            str::stream() << "Failed to connect to " << _lastSlaveOkHost.toString(),
+            newConn != NULL);
 
-        _slave.reset( new DBClientConnection( true , this , _so_timeout ) );
-        _slave->connect( _slaveHost );
-        _auth( _slave.get() );
-        return _slave.get();
+    _lastSlaveOkConn.reset(newConn);
+    _lastSlaveOkConn->setParentReplSetName(_setName);
+    _lastSlaveOkConn->setRequestMetadataWriter(getRequestMetadataWriter());
+    _lastSlaveOkConn->setReplyMetadataReader(getReplyMetadataReader());
+
+    if (_authPooledSecondaryConn) {
+        _authConnection(_lastSlaveOkConn.get());
+    } else {
+        // Mongos pooled connections are authenticated through
+        // ShardingConnectionHook::onCreate().
     }
 
+    LOG(3) << "dbclient_rs selecting node " << _lastSlaveOkHost << endl;
 
-    void DBClientReplicaSet::_auth( DBClientConnection * conn ) {
-        for ( list<AuthInfo>::iterator i=_auths.begin(); i!=_auths.end(); ++i ) {
-            const AuthInfo& a = *i;
-            string errmsg;
-            if ( ! conn->auth( a.dbname , a.username , a.pwd , errmsg, a.digestPassword ) )
-                warning() << "cached auth failed for set: " << _monitor->getName() << " db: " << a.dbname << " user: " << a.username << endl;
-
-        }
-
-    }
-
-    DBClientConnection& DBClientReplicaSet::masterConn() {
-        return *checkMaster();
-    }
-
-    DBClientConnection& DBClientReplicaSet::slaveConn() {
-        return *checkSlave();
-    }
-
-    bool DBClientReplicaSet::connect() {
-        try {
-            checkMaster();
-        }
-        catch (AssertionException&) {
-            if (_master && _monitor) {
-                _monitor->notifyFailure(_masterHost);
-            }
-            return false;
-        }
-        return true;
-    }
-
-    bool DBClientReplicaSet::auth(const string &dbname, const string &username, const string &pwd, string& errmsg, bool digestPassword, Auth::Level * level) {
-        DBClientConnection * m = checkMaster();
-
-        // first make sure it actually works
-        if( ! m->auth(dbname, username, pwd, errmsg, digestPassword, level ) )
-            return false;
-
-        // now that it does, we should save so that for a new node we can auth
-        _auths.push_back( AuthInfo( dbname , username , pwd , digestPassword ) );
-        return true;
-    }
-
-    // ------------- simple functions -----------------
-
-    void DBClientReplicaSet::insert( const string &ns , BSONObj obj , int flags) {
-        checkMaster()->insert(ns, obj, flags);
-    }
-
-    void DBClientReplicaSet::insert( const string &ns, const vector< BSONObj >& v , int flags) {
-        checkMaster()->insert(ns, v, flags);
-    }
-
-    void DBClientReplicaSet::remove( const string &ns , Query obj , bool justOne ) {
-        checkMaster()->remove(ns, obj, justOne);
-    }
-
-    void DBClientReplicaSet::update( const string &ns , Query query , BSONObj obj , bool upsert , bool multi ) {
-        return checkMaster()->update(ns, query, obj, upsert,multi);
-    }
-
-    auto_ptr<DBClientCursor> DBClientReplicaSet::query(const string &ns, Query query, int nToReturn, int nToSkip,
-            const BSONObj *fieldsToReturn, int queryOptions, int batchSize) {
-
-        if ( queryOptions & QueryOption_SlaveOk ) {
-            // we're ok sending to a slave
-            // we'll try 2 slaves before just using master
-            // checkSlave will try a different slave automatically after a failure
-            for ( int i=0; i<3; i++ ) {
-                try {
-                    return checkSlaveQueryResult( checkSlave()->query(ns,query,nToReturn,nToSkip,fieldsToReturn,queryOptions,batchSize) );
-                }
-                catch ( DBException &e ) {
-                    LOG(1) << "can't query replica set slave " << i << " : " << _slaveHost << causedBy( e ) << endl;
-                }
-            }
-        }
-
-        return checkMaster()->query(ns,query,nToReturn,nToSkip,fieldsToReturn,queryOptions,batchSize);
-    }
-
-    BSONObj DBClientReplicaSet::findOne(const string &ns, const Query& query, const BSONObj *fieldsToReturn, int queryOptions) {
-        if ( queryOptions & QueryOption_SlaveOk ) {
-            // we're ok sending to a slave
-            // we'll try 2 slaves before just using master
-            // checkSlave will try a different slave automatically after a failure
-            for ( int i=0; i<3; i++ ) {
-                try {
-                    return checkSlave()->findOne(ns,query,fieldsToReturn,queryOptions);
-                }
-                catch ( DBException &e ) {
-                	LOG(1) << "can't findone replica set slave " << i << " : " << _slaveHost << causedBy( e ) << endl;
-                }
-            }
-        }
-
-        return checkMaster()->findOne(ns,query,fieldsToReturn,queryOptions);
-    }
-
-    void DBClientReplicaSet::killCursor( long long cursorID ) {
-        // we should neve call killCursor on a replica set conncetion
-        // since we don't know which server it belongs to
-        // can't assume master because of slave ok
-        // and can have a cursor survive a master change
-        assert(0);
-    }
-
-    void DBClientReplicaSet::isntMaster() { 
-        log() << "got not master for: " << _masterHost << endl;
-        _monitor->notifyFailure( _masterHost );
-        _master.reset(); 
-    }
-
-    auto_ptr<DBClientCursor> DBClientReplicaSet::checkSlaveQueryResult( auto_ptr<DBClientCursor> result ){
-        BSONObj error;
-        bool isError = result->peekError( &error );
-        if( ! isError ) return result;
-
-        // We only check for "not master or secondary" errors here
-
-        // If the error code here ever changes, we need to change this code also
-        BSONElement code = error["code"];
-        if( code.isNumber() && code.Int() == 13436 /* not master or secondary */ ){
-            isntSecondary();
-            throw DBException( str::stream() << "slave " << _slaveHost.toString() << " is no longer secondary", 14812 );
-        }
-
-        return result;
-    }
-
-    void DBClientReplicaSet::isntSecondary() {
-        log() << "slave no longer has secondary status: " << _slaveHost << endl;
-        // Failover to next slave
-        _monitor->notifySlaveFailure( _slaveHost );
-        _slave.reset();
-    }
-
-    void DBClientReplicaSet::say( Message& toSend, bool isRetry , string * actualServer ) {
-
-        if( ! isRetry )
-            _lazyState = LazyState();
-
-        int lastOp = -1;
-        bool slaveOk = false;
-
-        if ( ( lastOp = toSend.operation() ) == dbQuery ) {
-            // TODO: might be possible to do this faster by changing api
-            DbMessage dm( toSend );
-            QueryMessage qm( dm );
-            if ( ( slaveOk = ( qm.queryOptions & QueryOption_SlaveOk ) ) ) {
-
-                for ( int i = _lazyState._retries; i < 3; i++ ) {
-                    try {
-                        DBClientConnection* slave = checkSlave();
-                        if ( actualServer )
-                            *actualServer = slave->getServerAddress();
-                        slave->say( toSend );
-
-                        _lazyState._lastOp = lastOp;
-                        _lazyState._slaveOk = slaveOk;
-                        _lazyState._retries = i;
-                        _lazyState._lastClient = slave;
-                        return;
-                    }
-                    catch ( DBException &e ) {
-                       LOG(1) << "can't callLazy replica set slave " << i << " : " << _slaveHost << causedBy( e ) << endl;
-                    }
-                }
-            }
-        }
-
-        DBClientConnection* master = checkMaster();
-        if ( actualServer )
-            *actualServer = master->getServerAddress();
-
-        master->say( toSend );
-
-        _lazyState._lastOp = lastOp;
-        _lazyState._slaveOk = slaveOk;
-        _lazyState._retries = 3;
-        _lazyState._lastClient = master;
-        return;
-    }
-
-    bool DBClientReplicaSet::recv( Message& m ) {
-
-        assert( _lazyState._lastClient );
-
-        // TODO: It would be nice if we could easily wrap a conn error as a result error
-        try {
-            return _lazyState._lastClient->recv( m );
-        }
-        catch( DBException& e ){
-            log() << "could not receive data from " << _lazyState._lastClient << causedBy( e ) << endl;
-            return false;
-        }
-    }
-
-    void DBClientReplicaSet::checkResponse( const char* data, int nReturned, bool* retry, string* targetHost ){
-
-        // For now, do exactly as we did before, so as not to break things.  In general though, we
-        // should fix this so checkResponse has a more consistent contract.
-        if( ! retry ){
-            if( _lazyState._lastClient )
-                return _lazyState._lastClient->checkResponse( data, nReturned );
-            else
-                return checkMaster()->checkResponse( data, nReturned );
-        }
-
-        *retry = false;
-        if( targetHost && _lazyState._lastClient ) *targetHost = _lazyState._lastClient->getServerAddress();
-        else if (targetHost) *targetHost = "";
-
-        if( ! _lazyState._lastClient ) return;
-        if( nReturned != 1 && nReturned != -1 ) return;
-
-        BSONObj dataObj;
-        if( nReturned == 1 ) dataObj = BSONObj( data );
-
-        // Check if we should retry here
-        if( _lazyState._lastOp == dbQuery && _lazyState._slaveOk ){
-
-            // Check the error code for a slave not secondary error
-            if( nReturned == -1 ||
-                ( hasErrField( dataObj ) &&  ! dataObj["code"].eoo() && dataObj["code"].Int() == 13436 ) ){
-
-                bool wasMaster = false;
-                if( _lazyState._lastClient == _slave.get() ){
-                    isntSecondary();
-                }
-                else if( _lazyState._lastClient == _master.get() ){
-                    wasMaster = true;
-                    isntMaster();
-                }
-                else
-                    warning() << "passed " << dataObj << " but last rs client " << _lazyState._lastClient->toString() << " is not master or secondary" << endl;
-
-                if( _lazyState._retries < 3 ){
-                    _lazyState._retries++;
-                    *retry = true;
-                }
-                else{
-                    (void)wasMaster; // silence set-but-not-used warning
-                    // assert( wasMaster );
-                    // printStackTrace();
-                    log() << "too many retries (" << _lazyState._retries << "), could not get data from replica set" << endl;
-                }
-            }
-        }
-        else if( _lazyState._lastOp == dbQuery ){
-            // slaveOk is not set, just mark the master as bad
-
-            if( nReturned == -1 ||
-               ( hasErrField( dataObj ) &&  ! dataObj["code"].eoo() && dataObj["code"].Int() == 13435 ) )
-            {
-                if( _lazyState._lastClient == _master.get() ){
-                    isntMaster();
-                }
-            }
-        }
-    }
-
-
-    bool DBClientReplicaSet::call( Message &toSend, Message &response, bool assertOk , string * actualServer ) {
-        const char * ns = 0;
-
-        if ( toSend.operation() == dbQuery ) {
-            // TODO: might be possible to do this faster by changing api
-            DbMessage dm( toSend );
-            QueryMessage qm( dm );
-            ns = qm.ns;
-
-            if ( qm.queryOptions & QueryOption_SlaveOk ) {
-                for ( int i=0; i<3; i++ ) {
-                    try {
-                        DBClientConnection* s = checkSlave();
-                        if ( actualServer )
-                            *actualServer = s->getServerAddress();
-                        return s->call( toSend , response , assertOk );
-                    }
-                    catch ( DBException &e ) {
-                    	LOG(1) << "can't call replica set slave " << i << " : " << _slaveHost << causedBy( e ) << endl;
-                        if ( actualServer )
-                            *actualServer = "";
-                    }
-                }
-            }
-        }
-        
-        DBClientConnection* m = checkMaster();
-        if ( actualServer )
-            *actualServer = m->getServerAddress();
-        
-        if ( ! m->call( toSend , response , assertOk ) )
-            return false;
-
-        if ( ns ) {
-            QueryResult * res = (QueryResult*)response.singleData();
-            if ( res->nReturned == 1 ) {
-                BSONObj x(res->data() );
-                if ( str::contains( ns , "$cmd" ) ) {
-                    if ( isNotMasterErrorString( x["errmsg"] ) )
-                        isntMaster();
-                }
-                else {
-                    if ( isNotMasterErrorString( getErrField( x ) ) )
-                        isntMaster();
-                }
-            }
-        }
-
-        return true;
-    }
-
+    return _lastSlaveOkConn.get();
 }
+
+void DBClientReplicaSet::say(Message& toSend, bool isRetry, string* actualServer) {
+    if (!isRetry)
+        _lazyState = LazyState();
+
+    const int lastOp = toSend.operation();
+
+    if (lastOp == dbQuery) {
+        // TODO: might be possible to do this faster by changing api
+        DbMessage dm(toSend);
+        QueryMessage qm(dm);
+
+        shared_ptr<ReadPreferenceSetting> readPref(_extractReadPref(qm.query, qm.queryOptions));
+        if (_isSecondaryQuery(qm.ns, qm.query, *readPref)) {
+            LOG(3) << "dbclient_rs say using secondary or tagged node selection in "
+                   << _getMonitor()->getName() << ", read pref is " << readPref->toString()
+                   << " (primary : "
+                   << (_master.get() != NULL ? _master->getServerAddress() : "[not cached]")
+                   << ", lastTagged : " << (_lastSlaveOkConn.get() != NULL
+                                                ? _lastSlaveOkConn->getServerAddress()
+                                                : "[not cached]")
+                   << ")" << endl;
+
+            string lastNodeErrMsg;
+
+            for (size_t retry = 0; retry < MAX_RETRY; retry++) {
+                _lazyState._retries = retry;
+                try {
+                    DBClientConnection* conn = selectNodeUsingTags(readPref);
+
+                    if (conn == NULL) {
+                        break;
+                    }
+
+                    if (actualServer != NULL) {
+                        *actualServer = conn->getServerAddress();
+                    }
+
+                    conn->say(toSend);
+
+                    _lazyState._lastOp = lastOp;
+                    _lazyState._secondaryQueryOk = true;
+                    _lazyState._lastClient = conn;
+                } catch (const DBException& ex) {
+                    const Status status = ex.toStatus();
+                    lastNodeErrMsg = str::stream() << "can't callLazy replica set node "
+                                                   << _lastSlaveOkHost.toString() << ": "
+                                                   << status.reason();
+                    _invalidateLastSlaveOkCache({status.code(), lastNodeErrMsg});
+
+                    continue;
+                }
+
+                return;
+            }
+
+            StringBuilder assertMsg;
+            assertMsg << "Failed to call say, no good nodes in " << _getMonitor()->getName();
+            if (!lastNodeErrMsg.empty()) {
+                assertMsg << ", last error: " << lastNodeErrMsg;
+            }
+
+            uasserted(16380, assertMsg.str());
+        }
+    }
+
+    LOG(3) << "dbclient_rs say to primary node in " << _getMonitor()->getName() << endl;
+
+    DBClientConnection* master = checkMaster();
+    if (actualServer)
+        *actualServer = master->getServerAddress();
+
+    _lazyState._lastOp = lastOp;
+    _lazyState._secondaryQueryOk = false;
+    // Don't retry requests to primary since there is only one host to try
+    _lazyState._retries = MAX_RETRY;
+    _lazyState._lastClient = master;
+
+    master->say(toSend);
+    return;
+}
+
+bool DBClientReplicaSet::recv(Message& m) {
+    verify(_lazyState._lastClient);
+
+    // TODO: It would be nice if we could easily wrap a conn error as a result error
+    try {
+        return _lazyState._lastClient->recv(m);
+    } catch (DBException& e) {
+        log() << "could not receive data from " << _lazyState._lastClient->toString()
+              << causedBy(redact(e));
+        return false;
+    }
+}
+
+void DBClientReplicaSet::checkResponse(const char* data,
+                                       int nReturned,
+                                       bool* retry,
+                                       string* targetHost) {
+    // For now, do exactly as we did before, so as not to break things.  In general though, we
+    // should fix this so checkResponse has a more consistent contract.
+    if (!retry) {
+        if (_lazyState._lastClient)
+            return _lazyState._lastClient->checkResponse(data, nReturned);
+        else
+            return checkMaster()->checkResponse(data, nReturned);
+    }
+
+    *retry = false;
+    if (targetHost && _lazyState._lastClient)
+        *targetHost = _lazyState._lastClient->getServerAddress();
+    else if (targetHost)
+        *targetHost = "";
+
+    if (!_lazyState._lastClient)
+        return;
+
+    // nReturned == 1 means that we got one result back, which might be an error
+    // nReturned == -1 is a sentinel value for "no data returned" aka (usually) network problem
+    // If neither, this must be a query result so our response is ok wrt the replica set
+    if (nReturned != 1 && nReturned != -1)
+        return;
+
+    BSONObj dataObj;
+    if (nReturned == 1)
+        dataObj = BSONObj(data);
+
+    // Check if we should retry here
+    if (_lazyState._lastOp == dbQuery && _lazyState._secondaryQueryOk) {
+        // query could potentially go to a secondary, so see if this is an error (or empty) and
+        // retry if we're not past our retry limit.
+
+        if (nReturned == -1 /* no result, maybe network problem */ ||
+            (hasErrField(dataObj) && !dataObj["code"].eoo() &&
+             dataObj["code"].Int() == ErrorCodes::NotMasterOrSecondary)) {
+            if (_lazyState._lastClient == _lastSlaveOkConn.get()) {
+                isntSecondary();
+            } else if (_lazyState._lastClient == _master.get()) {
+                isntMaster();
+            } else {
+                warning() << "passed " << redact(dataObj) << " but last rs client "
+                          << _lazyState._lastClient->toString() << " is not master or secondary"
+                          << endl;
+            }
+
+            if (_lazyState._retries < static_cast<int>(MAX_RETRY)) {
+                _lazyState._retries++;
+                *retry = true;
+            } else {
+                log() << "too many retries (" << _lazyState._retries
+                      << "), could not get data from replica set" << endl;
+            }
+        }
+    } else if (_lazyState._lastOp == dbQuery) {
+        // if query could not potentially go to a secondary, just mark the master as bad
+
+        if (nReturned == -1 /* no result, maybe network problem */ ||
+            (hasErrField(dataObj) && !dataObj["code"].eoo() &&
+             dataObj["code"].Int() == ErrorCodes::NotMasterNoSlaveOk)) {
+            if (_lazyState._lastClient == _master.get()) {
+                isntMaster();
+            }
+        }
+    }
+}
+
+std::pair<rpc::UniqueReply, DBClientWithCommands*> DBClientReplicaSet::runCommandWithTarget(
+    OpMsgRequest request) {
+    // This overload exists so we can parse out the read preference and then use server
+    // selection directly without having to re-parse the raw message.
+
+    // TODO: eventually we will want to pass the metadata before serializing it to BSON
+    // so we don't have to re-parse it, however, that will come with its own set of
+    // complications (e.g. some kind of base class or concept for MetadataSerializable
+    // objects). For now we do it the stupid way.
+    auto readPref = uassertStatusOK(ReadPreferenceSetting::fromContainingBSON(request.body));
+
+    if (readPref.pref == ReadPreference::PrimaryOnly ||
+        // If the command is not runnable on a secondary, we run it on the primary
+        // regardless of the read preference.
+        !_isSecondaryCommand(request.getCommandName(), request.body)) {
+        auto conn = checkMaster();
+        return conn->runCommandWithTarget(std::move(request));
+    }
+
+    auto rpShared = std::make_shared<ReadPreferenceSetting>(std::move(readPref));
+
+    for (size_t retry = 0; retry < MAX_RETRY; ++retry) {
+        try {
+            auto* conn = selectNodeUsingTags(rpShared);
+            if (conn == nullptr) {
+                break;
+            }
+            // We can't move the request since we need it to retry.
+            return conn->runCommandWithTarget(request);
+        } catch (const DBException& ex) {
+            _invalidateLastSlaveOkCache(ex.toStatus());
+        }
+    }
+
+    uasserted(ErrorCodes::NodeNotFound,
+              str::stream() << "Could not satisfy $readPreference of '" << readPref.toString()
+                            << "' while attempting to run command "
+                            << request.getCommandName());
+}
+
+bool DBClientReplicaSet::call(Message& toSend,
+                              Message& response,
+                              bool assertOk,
+                              string* actualServer) {
+    const char* ns = 0;
+
+    if (toSend.operation() == dbQuery) {
+        // TODO: might be possible to do this faster by changing api
+        DbMessage dm(toSend);
+        QueryMessage qm(dm);
+        ns = qm.ns;
+
+        shared_ptr<ReadPreferenceSetting> readPref(_extractReadPref(qm.query, qm.queryOptions));
+        if (_isSecondaryQuery(ns, qm.query, *readPref)) {
+            LOG(3) << "dbclient_rs call using secondary or tagged node selection in "
+                   << _getMonitor()->getName() << ", read pref is " << readPref->toString()
+                   << " (primary : "
+                   << (_master.get() != NULL ? _master->getServerAddress() : "[not cached]")
+                   << ", lastTagged : " << (_lastSlaveOkConn.get() != NULL
+                                                ? _lastSlaveOkConn->getServerAddress()
+                                                : "[not cached]")
+                   << ")" << endl;
+
+            for (size_t retry = 0; retry < MAX_RETRY; retry++) {
+                try {
+                    DBClientConnection* conn = selectNodeUsingTags(readPref);
+
+                    if (conn == NULL) {
+                        return false;
+                    }
+
+                    if (actualServer != NULL) {
+                        *actualServer = conn->getServerAddress();
+                    }
+
+                    return conn->call(toSend, response, assertOk, nullptr);
+                } catch (const DBException& ex) {
+                    if (actualServer)
+                        *actualServer = "";
+
+                    const Status status = ex.toStatus();
+                    _invalidateLastSlaveOkCache(
+                        {status.code(),
+                         str::stream() << "can't call replica set node " << _lastSlaveOkHost << ": "
+                                       << status.reason()});
+                }
+            }
+
+            // Was not able to successfully send after max retries
+            return false;
+        }
+    }
+
+    LOG(3) << "dbclient_rs call to primary node in " << _getMonitor()->getName() << endl;
+
+    DBClientConnection* m = checkMaster();
+    if (actualServer)
+        *actualServer = m->getServerAddress();
+
+    if (!m->call(toSend, response, assertOk, nullptr))
+        return false;
+
+    if (ns) {
+        QueryResult::View res = response.singleData().view2ptr();
+        if (res.getNReturned() == 1) {
+            BSONObj x(res.data());
+            if (str::contains(ns, "$cmd")) {
+                if (isNotMasterErrorString(x["errmsg"]))
+                    isntMaster();
+            } else {
+                if (isNotMasterErrorString(getErrField(x)))
+                    isntMaster();
+            }
+        }
+    }
+
+    return true;
+}
+
+void DBClientReplicaSet::_invalidateLastSlaveOkCache(const Status& status) {
+    // This is not wrapped in with if (_lastSlaveOkConn && _lastSlaveOkConn->isFailed()) because
+    // there are certain exceptions that will not make the connection be labeled as failed. For
+    // example, asserts 13079, 13080, 16386
+    _getMonitor()->failedHost(_lastSlaveOkHost, status);
+    resetSlaveOkConn();
+}
+
+void DBClientReplicaSet::reset() {
+    resetSlaveOkConn();
+    _lazyState._lastClient = NULL;
+    _lastReadPref.reset();
+}
+
+void DBClientReplicaSet::setAuthPooledSecondaryConn(bool setting) {
+    _authPooledSecondaryConn = setting;
+}
+
+void DBClientReplicaSet::resetMaster() {
+    if (_master.get() == _lastSlaveOkConn.get()) {
+        _lastSlaveOkConn.release();
+        _lastSlaveOkHost = HostAndPort();
+    }
+
+    _master.reset();
+    _masterHost = HostAndPort();
+}
+
+void DBClientReplicaSet::resetSlaveOkConn() {
+    if (_lastSlaveOkConn.get() == _master.get()) {
+        _lastSlaveOkConn.release();
+    } else if (_lastSlaveOkConn.get() != NULL) {
+        if (_authPooledSecondaryConn) {
+            logoutAll(_lastSlaveOkConn.get());
+        } else {
+            // Mongos pooled connections are all authenticated with the same credentials;
+            // so no need to logout.
+        }
+
+        // If the connection was bad, the pool will clean it up.
+        globalConnPool.release(_lastSlaveOkHost.toString(), _lastSlaveOkConn.release());
+    }
+
+    _lastSlaveOkHost = HostAndPort();
+}
+
+}  // namespace mongo

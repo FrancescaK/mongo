@@ -1,42 +1,43 @@
-// running ops should be killed
-// dropped collection should be ok after restart
-
-//if ( typeof _threadInject == "undefined" ) { // don't run in v8 mode - SERVER-2076
-
-port = allocatePorts( 1 )[ 0 ]
+/**
+ * Verify that killing an instance of mongod while it is in a long running computation or infinite
+ * loop still leads to clean shutdown, and that said shutdown is prompt.
+ *
+ * For our purposes, "prompt" is defined as "before stopMongod() decides to send a SIGKILL", which
+ * would not result in a zero return code.
+ */
 
 var baseName = "jstests_disk_killall";
+var dbpath = MongoRunner.dataPath + baseName;
 
-var m = startMongod( "--port", port, "--dbpath", "/data/db/" + baseName, "--nohttpinterface" );
+var mongod = MongoRunner.runMongod({dbpath: dbpath});
+var db = mongod.getDB("test");
+var collection = db.getCollection(baseName);
+assert.writeOK(collection.insert({}));
 
-m.getDB( "test" ).getCollection( baseName ).save( {} );
-m.getDB( "test" ).getLastError();
-
-s1 = startParallelShell( "db." + baseName + ".count( { $where: function() { while( 1 ) { ; } } } )", port );
-sleep( 1000 );
-
-s2 = startParallelShell( "db." + baseName + ".drop()", port );
-sleep( 1000 );
+var awaitShell = startParallelShell(
+    "db." + baseName + ".count( { $where: function() { while( 1 ) { ; } } } )", mongod.port);
+sleep(1000);
 
 /**
- * 12 == mongod's exit code on interrupt (eg standard kill)
- * stopMongod sends a standard kill signal to mongod, then waits for mongod to stop.  If mongod doesn't stop
- * in a reasonable amount of time, stopMongod sends kill -9 and in that case will not return 12.  We're checking
- * in this assert that mongod will stop quickly even while evaling an infinite loop in server side js.
- *
- * 14 is sometimes returned instead due to SERVER-2184
+ * 0 == mongod's exit code on Windows, or when it receives TERM, HUP or INT signals.  On UNIX
+ * variants, stopMongod sends a TERM signal to mongod, then waits for mongod to stop.  If mongod
+ * doesn't stop in a reasonable amount of time, stopMongod sends a KILL signal, in which case mongod
+ * will not exit cleanly.  We're checking in this assert that mongod will stop quickly even while
+ * evaling an infinite loop in server side js.
  */
-exitCode = stopMongod( port );
-assert( exitCode == 12 || exitCode == 14 || (_isWindows() && (exitCode == 0)), "got unexpected exitCode: " + exitCode );
+var exitCode = MongoRunner.stopMongod(mongod);
+assert.eq(0, exitCode, "got unexpected exitCode");
 
-s1();
-s2();
+// Waits for shell to complete
+exitCode = awaitShell({checkExitSuccess: false});
+assert.neq(0, exitCode, "expected shell to exit abnormally due to mongod being terminated");
 
-var m = startMongoProgram( "mongod", "--port", port, "--dbpath", "/data/db/" + baseName );
+mongod = MongoRunner.runMongod(
+    {port: mongod.port, restart: true, cleanData: false, dbpath: mongod.dbpath});
+db = mongod.getDB("test");
+collection = db.getCollection(baseName);
 
-m.getDB( "test" ).getCollection( baseName ).stats();
-m.getDB( "test" ).getCollection( baseName ).drop();
+assert(collection.stats().ok);
+assert(collection.drop());
 
-stopMongod( port );
-
-//}
+MongoRunner.stopMongod(mongod);

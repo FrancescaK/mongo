@@ -1,46 +1,61 @@
-// a replica set's passive nodes should be okay to add as part of a shard config
+// A replica set's passive nodes should be okay to add as part of a shard config
+(function() {
 
-s = new ShardingTest( "addshard4", 2 , 0 , 1 , {useHostname : true});
+    var s = new ShardingTest({name: "addshard4", shards: 2, mongos: 1, other: {useHostname: true}});
 
-r = new ReplSetTest({name : "addshard4", nodes : 3, startPort : 31100});
-r.startSet();
+    var r = new ReplSetTest({name: "addshard4", nodes: 3});
+    r.startSet();
 
-var config = r.getReplSetConfig();
-config.members[2].priority = 0;
+    var config = r.getReplSetConfig();
+    config.members[2].priority = 0;
 
-r.initiate(config);
-//Wait for replica set to be fully initialized - could take some time
-//to pre-allocate files on slow systems
-r.awaitReplication();
+    r.initiate(config);
+    // Wait for replica set to be fully initialized - could take some time
+    // to pre-allocate files on slow systems
+    r.awaitReplication();
 
-var master = r.getMaster();
+    var master = r.getPrimary();
 
-var members = config.members.map(function(elem) { return elem.host; });
-var shardName = "addshard4/"+members.join(",");
+    var members = config.members.map(function(elem) {
+        return elem.host;
+    });
+    var shardName = "addshard4/" + members.join(",");
+    var invalidShardName = "addshard4/foobar";
 
-print("adding shard "+shardName);
+    print("adding shard " + shardName);
 
-var result = s.adminCommand({"addshard" : shardName});
+    // First try adding shard with the correct replica set name but incorrect hostname
+    // This will make sure that the metadata for this replica set name is cleaned up
+    // so that the set can be added correctly when it has the proper hostnames.
+    assert.throws(function() {
+        s.adminCommand({"addshard": invalidShardName});
+    });
 
-printjson(result);
-assert.eq(result, true);
+    var result = s.adminCommand({"addshard": shardName});
 
-r = new ReplSetTest({name : "addshard42", nodes : 3, startPort : 31200});
-r.startSet();
+    printjson(result);
+    assert.eq(result, true);
 
-config = r.getReplSetConfig();
-config.members[2].arbiterOnly = true;
+    r = new ReplSetTest({name: "addshard42", nodes: 3});
+    r.startSet();
 
-r.initiate(config);
-// Wait for replica set to be fully initialized - could take some time
-// to pre-allocate files on slow systems
-r.awaitReplication();
+    config = r.getReplSetConfig();
+    config.members[2].arbiterOnly = true;
 
-master = r.getMaster();
+    r.initiate(config);
+    // Wait for replica set to be fully initialized - could take some time
+    // to pre-allocate files on slow systems
+    r.awaitReplication();
 
-print("adding shard addshard42");
+    master = r.getPrimary();
 
-result = s.adminCommand({"addshard" : "addshard42/"+config.members[2].host});
+    print("adding shard addshard42");
 
-printjson(result);
-assert.eq(result, true);
+    result = s.adminCommand({"addshard": "addshard42/" + config.members[2].host});
+
+    printjson(result);
+    assert.eq(result, true);
+
+    s.stop();
+
+})();

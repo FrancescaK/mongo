@@ -1,48 +1,60 @@
 // Tests that an empty shard can't be the cause of a chunk reset
 
-var st = new ShardingTest({ shards : 2, mongos : 2 })
+var st = new ShardingTest({shards: 2, mongos: 2});
 
-var coll = st.s.getCollection( jsTestName() + ".coll" )
+// Don't balance since we're manually moving chunks
+st.stopBalancer();
 
-for( var i = -10; i < 10; i++ )
-    coll.insert({ _id : i })
-   
-st.shardColl( coll, { _id : 1 }, { _id : 0 } )
+var coll = st.s.getCollection(jsTestName() + ".coll");
 
-jsTestLog( "Sharded setup complete" )
+for (var i = -10; i < 10; i++)
+    coll.insert({_id: i});
 
-st.printShardingStatus()
+st.shardColl(coll, {_id: 1}, {_id: 0});
 
-jsTestLog( "Setting initial versions for each mongos..." )
+jsTestLog("Sharded setup complete");
 
-coll.find().itcount()
+st.printShardingStatus();
 
-var collB = st.s1.getCollection( "" + coll )
-collB.find().itcount()
+jsTestLog("Setting initial versions for each mongos...");
 
-jsTestLog( "Migrating via first mongos..." )
+coll.find().itcount();
 
-var fullShard = st.getShard( coll, { _id : 1 } )
-var emptyShard = st.getShard( coll, { _id : -1 } )
+var collB = st.s1.getCollection("" + coll);
+collB.find().itcount();
 
-var admin = st.s.getDB( "admin" )
-printjson( admin.runCommand({ moveChunk : "" + coll, find : { _id : -1 }, to : fullShard.shardName }) )
+jsTestLog("Migrating via first mongos...");
 
-jsTestLog( "Resetting shard version via first mongos..." )
+var fullShard = st.getShard(coll, {_id: 1});
+var emptyShard = st.getShard(coll, {_id: -1});
 
-coll.find().itcount()
+var admin = st.s.getDB("admin");
+assert.soon(
+    function() {
+        var result = admin.runCommand(
+            {moveChunk: "" + coll, find: {_id: -1}, to: fullShard.shardName, _waitForDelete: true});
+        jsTestLog('moveChunk result = ' + tojson(result));
+        return result.ok;
+    },
+    "Setup FAILURE:  Unable to move chunk from " + emptyShard.shardName + " to " +
+        fullShard.shardName);
 
-jsTestLog( "Making sure we don't insert into the wrong shard..." )
+jsTestLog("Resetting shard version via first mongos...");
 
-collB.insert({ _id : -11 })
+coll.find().itcount();
 
-var emptyColl = emptyShard.getCollection( "" + coll )
+jsTestLog("Making sure we don't insert into the wrong shard...");
 
-print( emptyColl )
-print( emptyShard )
-print( emptyShard.shardName )
-st.printShardingStatus()
+collB.insert({_id: -11});
 
-assert.eq( 0, emptyColl.find().itcount() )
+var emptyColl = emptyShard.getCollection("" + coll);
 
+print(emptyColl);
+print(emptyShard);
+print(emptyShard.shardName);
+st.printShardingStatus();
 
+assert.eq(0, emptyColl.find().itcount());
+
+jsTestLog("DONE!");
+st.stop();

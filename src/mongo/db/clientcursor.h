@@ -1,454 +1,408 @@
-/* clientcursor.h */
-
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*/
-
-/* Cursor -- and its derived classes -- are our internal cursors.
-
-   ClientCursor is a wrapper that represents a cursorid from our database
-   application's perspective.
-*/
+ *    Copyright (C) 2008 10gen Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
-#include "../pch.h"
-#include "cursor.h"
-#include "jsobj.h"
-#include "../util/net/message.h"
-#include "../util/net/listen.h"
-#include "../util/background.h"
-#include "diskloc.h"
-#include "dbhelpers.h"
-#include "matcher.h"
-#include "../client/dbclient.h"
-#include "projection.h"
-#include "s/d_chunk_manager.h"
+#include <boost/optional.hpp>
+
+#include "mongo/client/dbclientinterface.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/cursor_id.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/logical_session_id.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/record_id.h"
+#include "mongo/stdx/functional.h"
+#include "mongo/util/net/message.h"
 
 namespace mongo {
 
-    typedef long long CursorId; /* passed to the client so it can send back on getMore */
-    class Cursor; /* internal server cursor base class */
-    class ClientCursor;
-    class ParsedQuery;
+class Collection;
+class CursorManager;
+class RecoveryUnit;
 
-    struct ByLocKey {
-
-        ByLocKey( const DiskLoc & l , const CursorId& i ) : loc(l), id(i) {}
-
-        static ByLocKey min( const DiskLoc& l ) { return ByLocKey( l , numeric_limits<long long>::min() ); }
-        static ByLocKey max( const DiskLoc& l ) { return ByLocKey( l , numeric_limits<long long>::max() ); }
-
-        bool operator<( const ByLocKey &other ) const {
-            int x = loc.compare( other.loc );
-            if ( x )
-                return x < 0;
-            return id < other.id;
+/**
+ * Parameters used for constructing a ClientCursor. Makes an owned copy of 'originatingCommandObj'
+ * to be used across getMores.
+ *
+ * ClientCursors cannot be constructed in isolation, but rather must be
+ * constructed and managed using a CursorManager. See cursor_manager.h for more details.
+ */
+struct ClientCursorParams {
+    ClientCursorParams(std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> planExecutor,
+                       NamespaceString nss,
+                       UserNameIterator authenticatedUsersIter,
+                       bool isReadCommitted,
+                       BSONObj originatingCommandObj)
+        : exec(std::move(planExecutor)),
+          nss(std::move(nss)),
+          isReadCommitted(isReadCommitted),
+          queryOptions(exec->getCanonicalQuery()
+                           ? exec->getCanonicalQuery()->getQueryRequest().getOptions()
+                           : 0),
+          originatingCommandObj(originatingCommandObj.getOwned()) {
+        while (authenticatedUsersIter.more()) {
+            authenticatedUsers.emplace_back(authenticatedUsersIter.next());
         }
+    }
 
-        DiskLoc loc;
-        CursorId id;
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
+    const NamespaceString nss;
+    std::vector<UserName> authenticatedUsers;
+    bool isReadCommitted = false;
+    int queryOptions = 0;
+    BSONObj originatingCommandObj;
+};
 
+/**
+ * A ClientCursor is the server-side state associated with a particular cursor id. A cursor id is a
+ * handle that we return to the client for queries which require results to be returned in multiple
+ * batches. The client can manage the server-side cursor state by passing the cursor id back to the
+ * server for certain supported operations.
+ *
+ * For instance, a client can retrieve the next batch of results from the cursor by issuing a
+ * getMore on this cursor id. It can also request that server-side resources be freed by issuing a
+ * killCursors on a particular cursor id. This is useful if the client wishes to abandon the cursor
+ * without retrieving all results.
+ *
+ * ClientCursors cannot exist in isolation and must be created, accessed, and destroyed via a
+ * CursorManager. See cursor_manager.h for more details. Unless the ClientCursor is marked by the
+ * caller as "no timeout", it will be automatically destroyed by its cursor manager after a period
+ * of inactivity.
+ */
+class ClientCursor {
+    MONGO_DISALLOW_COPYING(ClientCursor);
+
+public:
+    CursorId cursorid() const {
+        return _cursorid;
+    }
+
+    const NamespaceString& nss() const {
+        return _nss;
+    }
+
+    UserNameIterator getAuthenticatedUsers() const {
+        return makeUserNameIterator(_authenticatedUsers.begin(), _authenticatedUsers.end());
+    }
+
+    boost::optional<LogicalSessionId> getSessionId() const {
+        return _lsid;
+    }
+
+    bool isReadCommitted() const {
+        return _isReadCommitted;
+    }
+
+    /**
+     * Returns a pointer to the underlying query plan executor. All cursors manage a PlanExecutor,
+     * so this method never returns a null pointer.
+     */
+    PlanExecutor* getExecutor() const {
+        return _exec.get();
+    }
+
+    int queryOptions() const {
+        return _queryOptions;
+    }
+
+    const BSONObj& getOriginatingCommandObj() const {
+        return _originatingCommand;
+    }
+
+    /**
+     * Returns the total number of query results returned by the cursor so far.
+     */
+    long long pos() const {
+        return _pos;
+    }
+
+    /**
+     * Increments the cursor's tracked number of query results returned so far by 'n'.
+     */
+    void incPos(long long n) {
+        _pos += n;
+    }
+
+    /**
+     * Sets the cursor's tracked number of query results returned so far to 'n'.
+     */
+    void setPos(long long n) {
+        _pos = n;
+    }
+
+    //
+    // Timing.
+    //
+
+    /**
+     * Returns the amount of time execution time available to this cursor. Only valid at the
+     * beginning of a getMore request, and only really for use by the maxTime tracking code.
+     *
+     * Microseconds::max() == infinity, values less than 1 mean no time left.
+     */
+    Microseconds getLeftoverMaxTimeMicros() const {
+        return _leftoverMaxTimeMicros;
+    }
+
+    /**
+     * Sets the amount of execution time available to this cursor. This is only called when an
+     * operation that uses a cursor is finishing, to update its remaining time.
+     *
+     * Microseconds::max() == infinity, values less than 1 mean no time left.
+     */
+    void setLeftoverMaxTimeMicros(Microseconds leftoverMaxTimeMicros) {
+        _leftoverMaxTimeMicros = leftoverMaxTimeMicros;
+    }
+
+    //
+    // Replication-related methods.
+    //
+
+    // Used to report replication position only in master-slave, so we keep them as TimeStamp rather
+    // than OpTime.
+    void updateSlaveLocation(OperationContext* opCtx);
+
+    void slaveReadTill(const Timestamp& t) {
+        _slaveReadTill = t;
+    }
+
+    /** Just for testing. */
+    Timestamp getSlaveReadTill() const {
+        return _slaveReadTill;
+    }
+
+    /**
+     * Returns the server-wide the count of living cursors. Such a cursor is called an "open
+     * cursor".
+     */
+    static long long totalOpen();
+
+    friend std::size_t partitionOf(const ClientCursor* cursor) {
+        return cursor->cursorid();
+    }
+
+private:
+    friend class CursorManager;
+    friend class ClientCursorPin;
+
+    /**
+     * Since the client cursor destructor is private, this is needed for using client cursors with
+     * smart pointers.
+     */
+    struct Deleter {
+        void operator()(ClientCursor* cursor) {
+            delete cursor;
+        }
     };
 
-    /* todo: make this map be per connection.  this will prevent cursor hijacking security attacks perhaps.
-     *       ERH: 9/2010 this may not work since some drivers send getMore over a different connection
-    */
-    typedef map<CursorId, ClientCursor*> CCById;
-    typedef map<ByLocKey, ClientCursor*> CCByLoc;
+    /**
+     * Constructs a ClientCursor. Since cursors must come into being registered and pinned, this is
+     * private. See cursor_manager.h for more details.
+     */
+    ClientCursor(ClientCursorParams params,
+                 CursorManager* cursorManager,
+                 CursorId cursorId,
+                 boost::optional<LogicalSessionId> lsid,
+                 Date_t now);
 
-    extern BSONObj id_obj;
+    /**
+     * Destroys a ClientCursor. This is private, since only the CursorManager or the ClientCursorPin
+     * is allowed to destroy a cursor.
+     *
+     * Cursors must be unpinned and deregistered from the CursorManager before they can be
+     * destroyed.
+     */
+    ~ClientCursor();
 
-    class ClientCursor {
-        friend class CmdCursorInfo;
-    public:
-        static void assertNoCursors();
+    /**
+     * Marks this cursor as killed, so any future uses will return an error status including
+     * 'reason'.
+     */
+    void markAsKilled(const std::string& reason);
 
-        /* use this to assure we don't in the background time out cursor while it is under use.
-           if you are using noTimeout() already, there is no risk anyway.
-           Further, this mechanism guards against two getMore requests on the same cursor executing
-           at the same time - which might be bad.  That should never happen, but if a client driver
-           had a bug, it could (or perhaps some sort of attack situation).
-        */
-        class Pointer : boost::noncopyable {
-            ClientCursor *_c;
-        public:
-            ClientCursor * c() { return _c; }
-            void release() {
-                if( _c ) {
-                    assert( _c->_pinValue >= 100 );
-                    _c->_pinValue -= 100;
-                    _c = 0;
-                }
-            }
-            /**
-             * call this if during a yield, the cursor got deleted
-             * if so, we don't want to use the point address
-             */
-            void deleted() {
-                _c = 0;
-            }
-            ~Pointer() { release(); }
-            Pointer(long long cursorid) {
-                recursive_scoped_lock lock(ccmutex);
-                _c = ClientCursor::find_inlock(cursorid, true);
-                if( _c ) {
-                    if( _c->_pinValue >= 100 ) {
-                        _c = 0;
-                        uasserted(12051, "clientcursor already in use? driver problem?");
-                    }
-                    _c->_pinValue += 100;
-                }
-            }
-        };
+    /**
+     * Disposes this ClientCursor's PlanExecutor. Must be called before deleting a ClientCursor to
+     * ensure it has a chance to clean up any resources it is using. Can be called multiple times.
+     * It is an error to call any other method after calling dispose().
+     */
+    void dispose(OperationContext* opCtx);
 
-        // This object assures safe and reliable cleanup of a ClientCursor.
-        class CleanupPointer : boost::noncopyable {
-        public:
-            CleanupPointer() : _c( 0 ), _id( -1 ) {}
-            void reset( ClientCursor *c = 0 ) {
-                if ( c == _c )
-                    return;
-                if ( _c ) {
-                    // be careful in case cursor was deleted by someone else
-                    ClientCursor::erase( _id );
-                }
-                if ( c ) {
-                    _c = c;
-                    _id = c->_cursorid;
-                }
-                else {
-                    _c = 0;
-                    _id = -1;
-                }
-            }
-            ~CleanupPointer() {
-                DESTRUCTOR_GUARD ( reset(); );
-            }
-            operator bool() { return _c; }
-            ClientCursor * operator-> () { return _c; }
-        private:
-            ClientCursor *_c;
-            CursorId _id;
-        };
+    bool isNoTimeout() const {
+        return (_queryOptions & QueryOption_NoCursorTimeout);
+    }
 
-        /**
-         * Iterates through all ClientCursors, under its own ccmutex lock.
-         * Also supports deletion on the fly.
-         */
-        class LockedIterator : boost::noncopyable {
-        public:
-            LockedIterator() : _lock( ccmutex ), _i( clientCursorsById.begin() ) {}
-            bool ok() const { return _i != clientCursorsById.end(); }
-            ClientCursor *current() const { return _i->second; }
-            void advance() { ++_i; }
-            /**
-             * Delete 'current' and advance. Properly handles cascading deletions that may occur
-             * when one ClientCursor is directly deleted.
-             */
-            void deleteAndAdvance();
-        private:
-            recursive_scoped_lock _lock;
-            CCById::const_iterator _i;
-        };
-        
-        ClientCursor(int queryOptions, const shared_ptr<Cursor>& c, const string& ns, BSONObj query = BSONObj() );
+    // The ID of the ClientCursor. A value of 0 is used to mean that no cursor id has been assigned.
+    CursorId _cursorid = 0;
 
-        ~ClientCursor();
+    const NamespaceString _nss;
 
-        // ***************  basic accessors *******************
+    // The set of authenticated users when this cursor was created.
+    std::vector<UserName> _authenticatedUsers;
 
-        CursorId cursorid() const { return _cursorid; }
-        string ns() const { return _ns; }
-        Database * db() const { return _db; }
-        const BSONObj& query() const { return _query; }
-        int queryOptions() const { return _queryOptions; }
+    // A logical session id for this cursor, if it is running inside of a session.
+    const boost::optional<LogicalSessionId> _lsid;
 
-        DiskLoc lastLoc() const { return _lastLoc; }
+    const bool _isReadCommitted = false;
 
-        /* Get rid of cursors for namespaces 'ns'. When dropping a db, ns is "dbname."
-           Used by drop, dropIndexes, dropDatabase.
-        */
-        static void invalidate(const char *ns);
+    CursorManager* _cursorManager;
 
-        /**
-         * @param microsToSleep -1 : ask client
-         *                     >=0 : sleep for that amount
-         * @param recordToLoad after yielding lock, load this record with only mmutex
-         * do a dbtemprelease
-         * note: caller should check matcher.docMatcher().atomic() first and not yield if atomic -
-         *       we don't do herein as this->matcher (above) is only initialized for true queries/getmore.
-         *       (ie not set for remote/update)
-         * @return if the cursor is still valid.
-         *         if false is returned, then this ClientCursor should be considered deleted -
-         *         in fact, the whole database could be gone.
-         */
-        bool yield( int microsToSleep = -1 , Record * recordToLoad = 0 );
+    // Tracks whether dispose() has been called, to make sure it happens before destruction. It is
+    // an error to use a ClientCursor once it has been disposed.
+    bool _disposed = false;
 
-        enum RecordNeeds {
-            DontNeed = -1 , MaybeCovered = 0 , WillNeed = 100
-        };
-            
-        /**
-         * @param needRecord whether or not the next record has to be read from disk for sure
-         *                   if this is true, will yield of next record isn't in memory
-         * @param yielded true if a yield occurred, and potentially if a yield did not occur
-         * @return same as yield()
-         */
-        bool yieldSometimes( RecordNeeds need, bool *yielded = 0 );
+    // Tracks the number of results returned by this cursor so far.
+    long long _pos = 0;
 
-        static int suggestYieldMicros();
-        static void staticYield( int micros , const StringData& ns , Record * rec );
+    // Holds an owned copy of the command specification received from the client.
+    const BSONObj _originatingCommand;
 
-        struct YieldData { CursorId _id; bool _doingDeletes; };
-        bool prepareToYield( YieldData &data );
-        static bool recoverFromYield( const YieldData &data );
+    // See the QueryOptions enum in dbclientinterface.h.
+    const int _queryOptions = 0;
 
-        struct YieldLock : boost::noncopyable {
-            explicit YieldLock( ptr<ClientCursor> cc )
-                : _canYield(cc->_c->supportYields()) {
-                if ( _canYield ) {
-                    cc->prepareToYield( _data );
-                    _unlock.reset(new dbtempreleasecond());
-                }
-            }
-            ~YieldLock() {
-                if ( _unlock ) {
-                    log( LL_WARNING ) << "ClientCursor::YieldLock not closed properly" << endl;
-                    relock();
-                }
-            }
-            bool stillOk() {
-                if ( ! _canYield )
-                    return true;
-                relock();
-                return ClientCursor::recoverFromYield( _data );
-            }
-            void relock() {
-                _unlock.reset();
-            }
-        private:
-            const bool _canYield;
-            YieldData _data;
-            scoped_ptr<dbtempreleasecond> _unlock;
-        };
+    // The replication position only used in master-slave.
+    Timestamp _slaveReadTill;
 
-        // --- some pass through helpers for Cursor ---
+    // Unused maxTime budget for this cursor.
+    Microseconds _leftoverMaxTimeMicros = Microseconds::max();
 
-        Cursor* c() const { return _c.get(); }
-        int pos() const { return _pos; }
+    // The underlying query execution machinery. Must be non-null.
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> _exec;
 
-        void incPos( int n ) { _pos += n; } // TODO: this is bad
-        void setPos( int n ) { _pos = n; } // TODO : this is bad too
+    //
+    // The following fields are used by the CursorManager and the ClientCursorPin. In most
+    // conditions, they can only be used while holding the CursorManager's mutex. Exceptions
+    // include:
+    //   - If the ClientCursor is pinned, the CursorManager will never change '_isPinned' until
+    //     asked to by the ClientCursorPin.
+    //   - It is safe to read '_killed' while holding a collection lock, which must be held when
+    //     interacting with a ClientCursorPin.
+    //   - A ClientCursorPin can access these members after deregistering the cursor from the
+    //     CursorManager, at which point it has sole ownership of the ClientCursor.
+    //
 
-        BSONObj indexKeyPattern() { return _c->indexKeyPattern();  }
-        bool modifiedKeys() const { return _c->modifiedKeys(); }
-        bool isMultiKey() const { return _c->isMultiKey(); }
+    // TODO SERVER-28309 Remove this field and instead use _exec->markedAsKilled().
+    bool _killed = false;
 
-        bool ok() { return _c->ok(); }
-        bool advance() { return _c->advance(); }
-        BSONObj current() { return _c->current(); }
-        DiskLoc currLoc() { return _c->currLoc(); }
-        BSONObj currKey() const { return _c->currKey(); }
+    // While a cursor is being used by a client, it is marked as "pinned". See ClientCursorPin
+    // below.
+    //
+    // Cursors always come into existence in a pinned state.
+    bool _isPinned = true;
 
-        /**
-         * same as BSONObj::getFieldsDotted
-         * if it can be retrieved from key, it is
-         * @param holder keeps the currKey in scope by keeping a reference to it here. generally you'll want 
-         *        holder and ret to destruct about the same time.
-         * @return if this was retrieved from key
-         */
-        bool getFieldsDotted( const string& name, BSONElementSet &ret, BSONObj& holder );
+    Date_t _lastUseDate;
+};
 
-        /**
-         * same as BSONObj::getFieldDotted
-         * if it can be retrieved from key, it is
-         * @return if this was retrieved from key
-         */
-        BSONElement getFieldDotted( const string& name , BSONObj& holder , bool * fromKey = 0 ) ;
-        
-        /** extract items from object which match a pattern object.
-         * e.g., if pattern is { x : 1, y : 1 }, builds an object with
-         * x and y elements of this object, if they are present.
-         * returns elements with original field names
-         * NOTE: copied from BSONObj::extractFields
-        */
-        BSONObj extractFields(const BSONObj &pattern , bool fillWithNull = false) ;
-        
-        bool currentIsDup() { return _c->getsetdup( _c->currLoc() ); }
+/**
+ * ClientCursorPin is an RAII class which must be used in order to access a cursor. On construction,
+ * the ClientCursorPin marks its cursor as in use, which is called "pinning" the cursor. On
+ * destructrution, the ClientCursorPin marks its cursor as no longer in use, which is called
+ * "unpinning" the cursor. Pinning is used to prevent multiple concurrent uses of the same cursor---
+ * pinned cursors cannot be killed or timed out and cannot be used concurrently by other operations
+ * such as getMore or killCursors. A pin is obtained using the CursorManager. See cursor_manager.h
+ * for more details.
+ *
+ * A pin extends the lifetime of a ClientCursor object until the pin's release.  Pinned
+ * ClientCursor objects cannot not be killed due to inactivity, and cannot be killed by user
+ * kill requests.  When a CursorManager is destroyed (e.g. by a collection drop), ownership of
+ * any still-pinned ClientCursor objects is transferred to their managing ClientCursorPin
+ * objects.
+ *
+ * Example usage:
+ * {
+ *     StatusWith<ClientCursorPin> pin = cursorManager->pinCursor(opCtx, cursorid);
+ *     if (!pin.isOK()) {
+ *         // No cursor with id 'cursorid' exists, or it was killed while inactive. Handle the error
+ *         here.
+ *         return pin.getStatus();
+ *     }
+ *
+ *     ClientCursor* cursor = pin.getValue().getCursor();
+ *     // Use cursor. Pin automatically released on block exit.
+ * }
+ *
+ * Clients that wish to access ClientCursor objects owned by collection cursor managers must hold
+ * the collection lock while calling any pin method, including pin acquisition by the RAII
+ * constructor and pin release by the RAII destructor.  This guards from a collection drop (which
+ * requires an exclusive lock on the collection) occurring concurrently with the pin request or
+ * unpin request.
+ *
+ * Clients that wish to access ClientCursor objects owned by the global cursor manager need not
+ * hold any locks; the global cursor manager can only be destroyed by a process exit.
+ */
+class ClientCursorPin {
+    MONGO_DISALLOW_COPYING(ClientCursorPin);
 
-        bool currentMatches() {
-            if ( ! _c->matcher() )
-                return true;
-            return _c->matcher()->matchesCurrent( _c.get() );
-        }
+public:
+    /**
+     * Moves 'other' into 'this'. The 'other' pin must have a pinned cursor. Moving an empty pin
+     * into 'this' is illegal.
+     */
+    ClientCursorPin(ClientCursorPin&& other);
 
-        void setChunkManager( ShardChunkManagerPtr manager ){ _chunkManager = manager; }
-        ShardChunkManagerPtr getChunkManager(){ return _chunkManager; }
+    /**
+     * Moves 'other' into 'this'. 'other' must have a pinned cursor and 'this' must have no pinned
+     * cursor.
+     */
+    ClientCursorPin& operator=(ClientCursorPin&& other);
 
-    private:
-        void setLastLoc_inlock(DiskLoc);
+    /**
+     * Calls release().
+     */
+    ~ClientCursorPin();
 
-        static ClientCursor* find_inlock(CursorId id, bool warn = true) {
-            CCById::iterator it = clientCursorsById.find(id);
-            if ( it == clientCursorsById.end() ) {
-                if ( warn )
-                    OCCASIONALLY out() << "ClientCursor::find(): cursor not found in map " << id << " (ok after a drop)\n";
-                return 0;
-            }
-            return it->second;
-        }
-    public:
-        static ClientCursor* find(CursorId id, bool warn = true) {
-            recursive_scoped_lock lock(ccmutex);
-            ClientCursor *c = find_inlock(id, warn);
-            // if this asserts, your code was not thread safe - you either need to set no timeout
-            // for the cursor or keep a ClientCursor::Pointer in scope for it.
-            massert( 12521, "internal error: use of an unlocked ClientCursor", c == 0 || c->_pinValue );
-            return c;
-        }
+    /**
+     * Releases the pin.  It does not delete the underlying cursor unless ownership has passed
+     * to us after kill.  Turns into a no-op if release() or deleteUnderlying() have already
+     * been called on this pin.
+     */
+    void release();
 
-        /**
-         * Deletes the cursor with the provided @param 'id' if one exists.
-         * @throw if the cursor with the provided id is pinned.
-         */
-        static bool erase(CursorId id) {
-            recursive_scoped_lock lock(ccmutex);
-            ClientCursor *cc = find_inlock(id);
-            if ( cc ) {
-                assert( cc->_pinValue < 100 ); // you can't still have an active ClientCursor::Pointer
-                delete cc;
-                return true;
-            }
-            return false;
-        }
+    /**
+     * Deletes the underlying cursor.  Cannot be called if release() or deleteUnderlying() have
+     * already been called on this pin.
+     */
+    void deleteUnderlying();
 
-        /**
-         * @return number of cursors found
-         */
-        static int erase( int n , long long * ids );
+    /**
+     * Returns a pointer to the pinned cursor.
+     */
+    ClientCursor* getCursor() const;
 
-        /* call when cursor's location changes so that we can update the
-           cursorsbylocation map.  if you are locked and internally iterating, only
-           need to call when you are ready to "unlock".
-           */
-        void updateLocation();
+private:
+    friend class CursorManager;
 
-        void mayUpgradeStorage() {
-            /* if ( !ids_.get() )
-                return;
-            stringstream ss;
-            ss << ns << "." << cursorid;
-            ids_->mayUpgradeStorage( ss.str() );*/
-        }
+    ClientCursorPin(OperationContext* opCtx, ClientCursor* cursor);
 
-        /**
-         * @param millis amount of idle passed time since last call
-         */
-        bool shouldTimeout( unsigned millis );
+    OperationContext* _opCtx = nullptr;
+    ClientCursor* _cursor = nullptr;
+};
 
-        void storeOpForSlave( DiskLoc last );
-        void updateSlaveLocation( CurOp& curop );
+void startClientCursorMonitor();
 
-        unsigned idleTime() const { return _idleAgeMillis; }
-
-        void setDoingDeletes( bool doingDeletes ) {_doingDeletes = doingDeletes; }
-
-        void slaveReadTill( const OpTime& t ) { _slaveReadTill = t; }
-
-    public: // static methods
-
-        static void idleTimeReport(unsigned millis);
-
-        static void appendStats( BSONObjBuilder& result );
-        static unsigned numCursors() { return clientCursorsById.size(); }
-        static void informAboutToDeleteBucket(const DiskLoc& b);
-        static void aboutToDelete(const DiskLoc& dl);
-        static void find( const string& ns , set<CursorId>& all );
-
-
-    private: // methods
-
-        // cursors normally timeout after an inactivy period to prevent excess memory use
-        // setting this prevents timeout of the cursor in question.
-        void noTimeout() { _pinValue++; }
-
-        CCByLoc& byLoc() { return _db->ccByLoc; }
-        
-        Record* _recordForYield( RecordNeeds need );
-
-    private:
-
-        CursorId _cursorid;
-
-        const string _ns;
-        Database * _db;
-
-        const shared_ptr<Cursor> _c;
-        map<string,int> _indexedFields;  // map from indexed field to offset in key object
-        int _pos;                        // # objects into the cursor so far
-
-        const BSONObj _query;            // used for logging diags only; optional in constructor
-        int _queryOptions;        // see enum QueryOptions dbclient.h
-
-        OpTime _slaveReadTill;
-
-        DiskLoc _lastLoc;                        // use getter and setter not this (important)
-        unsigned _idleAgeMillis;                 // how long has the cursor been around, relative to server idle time
-
-        /* 0 = normal
-           1 = no timeout allowed
-           100 = in use (pinned) -- see Pointer class
-        */
-        unsigned _pinValue;
-
-        bool _doingDeletes; // when true we are the delete and aboutToDelete shouldn't manipulate us
-        ElapsedTracker _yieldSometimesTracker;
-
-        ShardChunkManagerPtr _chunkManager;
-
-    public:
-        shared_ptr<ParsedQuery> pq;
-        shared_ptr<Projection> fields; // which fields query wants returned
-        // TODO Maybe helper objects should manage their own memory rather than rely on the
-        // original message being valid.
-        Message originalMessage; // this is effectively an auto ptr for data the matcher points to
-
-
-
-    private: // static members
-
-        static CCById clientCursorsById;
-        static long long numberTimedOut;
-        static boost::recursive_mutex& ccmutex;   // must use this for all statics above!
-        static CursorId allocCursorId_inlock();
-
-    };
-
-    class ClientCursorMonitor : public BackgroundJob {
-    public:
-        string name() const { return "ClientCursorMonitor"; }
-        void run();
-    };
-
-} // namespace mongo
-
-// ClientCursor should only be used with auto_ptr because it needs to be
-// release()ed after a yield if stillOk() returns false and these pointer types
-// do not support releasing. This will prevent them from being used accidentally
-namespace boost{
-    template<> class scoped_ptr<mongo::ClientCursor> {};
-    template<> class shared_ptr<mongo::ClientCursor> {};
-}
+}  // namespace mongo

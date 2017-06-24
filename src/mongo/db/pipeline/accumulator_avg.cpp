@@ -12,112 +12,125 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * As a special exception, the copyright holders give permission to link the
+ * code of portions of this program with the OpenSSL library under certain
+ * conditions as described in each individual source file and distribute
+ * linked combinations including the program with the OpenSSL library. You
+ * must comply with the GNU Affero General Public License in all respects for
+ * all of the code used other than as permitted herein. If you modify file(s)
+ * with this exception, you may extend this exception to your version of the
+ * file(s), but you are not obligated to do so. If you do not wish to do so,
+ * delete this exception statement from your version. If you delete this
+ * exception statement from all source files in the program, then also delete
+ * it in the license file.
  */
 
-#include "pch.h"
-#include "accumulator.h"
+#include "mongo/platform/basic.h"
 
-#include "db/pipeline/document.h"
-#include "db/pipeline/expression_context.h"
-#include "db/pipeline/value.h"
+#include "mongo/db/pipeline/accumulator.h"
+
+#include "mongo/db/pipeline/accumulation_statement.h"
+#include "mongo/db/pipeline/document.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/value.h"
+#include "mongo/platform/decimal128.h"
 
 namespace mongo {
 
-    const char AccumulatorAvg::subTotalName[] = "subTotal";
-    const char AccumulatorAvg::countName[] = "count";
+using boost::intrusive_ptr;
 
-    intrusive_ptr<const Value> AccumulatorAvg::evaluate(
-        const intrusive_ptr<Document> &pDocument) const {
-        if (!pCtx->getInRouter()) {
-            Super::evaluate(pDocument);
-            ++count;
+REGISTER_ACCUMULATOR(avg, AccumulatorAvg::create);
+REGISTER_EXPRESSION(avg, ExpressionFromAccumulator<AccumulatorAvg>::parse);
+
+const char* AccumulatorAvg::getOpName() const {
+    return "$avg";
+}
+
+namespace {
+const char subTotalName[] = "subTotal";
+const char subTotalErrorName[] = "subTotalError";  // Used for extra precision
+const char countName[] = "count";
+}  // namespace
+
+void AccumulatorAvg::processInternal(const Value& input, bool merging) {
+    if (merging) {
+        // We expect an object that contains both a subtotal and a count. Additionally there may
+        // be an error value, that allows for additional precision.
+        // 'input' is what getValue(true) produced below.
+        verify(input.getType() == Object);
+        // We're recursively adding the subtotal to get the proper type treatment, but this only
+        // increments the count by one, so adjust the count afterwards. Similarly for 'error'.
+        processInternal(input[subTotalName], false);
+        _count += input[countName].getLong() - 1;
+        Value error = input[subTotalErrorName];
+        if (!error.missing()) {
+            processInternal(error, false);
+            _count--;  // The error correction only adjusts the total, not the number of items.
         }
-        else {
-            /*
-              If we're in the router, we expect an object that contains
-              both a subtotal and a count.  This is what getValue() produced
-              below.
-             */
-            intrusive_ptr<const Value> prhs(
-                vpOperand[0]->evaluate(pDocument));
-            assert(prhs->getType() == Object);
-            intrusive_ptr<Document> pShardDoc(prhs->getDocument());
-
-            intrusive_ptr<const Value> pSubTotal(
-                pShardDoc->getValue(subTotalName));
-            assert(pSubTotal.get());
-            BSONType subTotalType = pSubTotal->getType();
-            if ((totalType == NumberLong) || (subTotalType == NumberLong))
-                totalType = NumberLong;
-            if ((totalType == NumberDouble) || (subTotalType == NumberDouble))
-                totalType = NumberDouble;
-
-            if (subTotalType == NumberInt) {
-                int v = pSubTotal->getInt();
-                longTotal += v;
-                doubleTotal += v;
-            }
-            else if (subTotalType == NumberLong) {
-                long long v = pSubTotal->getLong();
-                longTotal += v;
-                doubleTotal += v;
-            }
-            else {
-                double v = pSubTotal->getDouble();
-                doubleTotal += v;
-            }
-                
-            intrusive_ptr<const Value> pCount(pShardDoc->getValue(countName));
-            count += pCount->getLong();
-        }
-
-        return Value::getZero();
+        return;
     }
 
-    intrusive_ptr<Accumulator> AccumulatorAvg::create(
-        const intrusive_ptr<ExpressionContext> &pCtx) {
-        intrusive_ptr<AccumulatorAvg> pA(new AccumulatorAvg(pCtx));
-        return pA;
+    switch (input.getType()) {
+        case NumberDecimal:
+            _decimalTotal = _decimalTotal.add(input.getDecimal());
+            _isDecimal = true;
+            break;
+        case NumberLong:
+            // Avoid summation using double as that loses precision.
+            _nonDecimalTotal.addLong(input.getLong());
+            break;
+        case NumberInt:
+        case NumberDouble:
+            _nonDecimalTotal.addDouble(input.getDouble());
+            break;
+        default:
+            dassert(!input.numeric());
+            return;
+    }
+    _count++;
+}
+
+intrusive_ptr<Accumulator> AccumulatorAvg::create(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    return new AccumulatorAvg(expCtx);
+}
+
+Decimal128 AccumulatorAvg::_getDecimalTotal() const {
+    return _decimalTotal.add(_nonDecimalTotal.getDecimal());
+}
+
+Value AccumulatorAvg::getValue(bool toBeMerged) {
+    if (toBeMerged) {
+        if (_isDecimal)
+            return Value(Document{{subTotalName, _getDecimalTotal()}, {countName, _count}});
+
+        double total, error;
+        std::tie(total, error) = _nonDecimalTotal.getDoubleDouble();
+        return Value(
+            Document{{subTotalName, total}, {countName, _count}, {subTotalErrorName, error}});
     }
 
-    intrusive_ptr<const Value> AccumulatorAvg::getValue() const {
-        if (!pCtx->getInShard()) {
-            double avg = 0;
-            if (count) {
-                if (totalType != NumberDouble)
-                    avg = static_cast<double>(longTotal / count);
-                else
-                    avg = doubleTotal / count;
-            }
+    if (_count == 0)
+        return Value(BSONNULL);
 
-            return Value::createDouble(avg);
-        }
+    if (_isDecimal)
+        return Value(_getDecimalTotal().divide(Decimal128(static_cast<int64_t>(_count))));
 
-        intrusive_ptr<Document> pDocument(Document::create());
+    return Value(_nonDecimalTotal.getDouble() / static_cast<double>(_count));
+}
 
-        intrusive_ptr<const Value> pSubTotal;
-        if (totalType == NumberInt)
-            pSubTotal = Value::createInt((int)longTotal);
-        else if (totalType == NumberLong)
-            pSubTotal = Value::createLong(longTotal);
-        else
-            pSubTotal = Value::createDouble(doubleTotal);
-        pDocument->addField(subTotalName, pSubTotal);
+AccumulatorAvg::AccumulatorAvg(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    : Accumulator(expCtx), _isDecimal(false), _count(0) {
+    // This is a fixed size Accumulator so we never need to update this
+    _memUsageBytes = sizeof(*this);
+}
 
-        intrusive_ptr<const Value> pCount(Value::createLong(count));
-        pDocument->addField(countName, pCount);
-
-        return Value::createDocument(pDocument);
-    }
-
-    AccumulatorAvg::AccumulatorAvg(
-        const intrusive_ptr<ExpressionContext> &pTheCtx):
-        AccumulatorSum(),
-        count(0),
-        pCtx(pTheCtx) {
-    }
-
-    const char *AccumulatorAvg::getOpName() const {
-        return "$avg";
-    }
+void AccumulatorAvg::reset() {
+    _isDecimal = false;
+    _nonDecimalTotal = {};
+    _decimalTotal = {};
+    _count = 0;
+}
 }

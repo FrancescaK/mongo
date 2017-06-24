@@ -12,68 +12,81 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * As a special exception, the copyright holders give permission to link the
+ * code of portions of this program with the OpenSSL library under certain
+ * conditions as described in each individual source file and distribute
+ * linked combinations including the program with the OpenSSL library. You
+ * must comply with the GNU Affero General Public License in all respects for
+ * all of the code used other than as permitted herein. If you modify file(s)
+ * with this exception, you may extend this exception to your version of the
+ * file(s), but you are not obligated to do so. If you do not wish to do so,
+ * delete this exception statement from your version. If you delete this
+ * exception statement from all source files in the program, then also delete
+ * it in the license file.
  */
 
-#include "pch.h"
-#include "accumulator.h"
+#include "mongo/platform/basic.h"
 
-#include "db/pipeline/expression_context.h"
-#include "db/pipeline/value.h"
+#include "mongo/db/pipeline/accumulator.h"
+
+#include "mongo/db/pipeline/accumulation_statement.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
-    intrusive_ptr<const Value> AccumulatorAddToSet::evaluate(
-        const intrusive_ptr<Document> &pDocument) const {
-        assert(vpOperand.size() == 1);
-        intrusive_ptr<const Value> prhs(vpOperand[0]->evaluate(pDocument));
 
-        if (prhs->getType() == Undefined)
-            ; /* nothing to add to the array */
-        else if (!pCtx->getInRouter())
-            set.insert(prhs);
-        else {
-            /*
-              If we're in the router, we need to take apart the arrays we
-              receive and put their elements into the array we are collecting.
-              If we didn't, then we'd get an array of arrays, with one array
-              from each shard that responds.
-             */
-            assert(prhs->getType() == Array);
-            
-            intrusive_ptr<ValueIterator> pvi(prhs->getArray());
-            while(pvi->more()) {
-                intrusive_ptr<const Value> pElement(pvi->next());
-                set.insert(pElement);
+using boost::intrusive_ptr;
+using std::vector;
+
+REGISTER_ACCUMULATOR(addToSet, AccumulatorAddToSet::create);
+
+const char* AccumulatorAddToSet::getOpName() const {
+    return "$addToSet";
+}
+
+void AccumulatorAddToSet::processInternal(const Value& input, bool merging) {
+    if (!merging) {
+        if (!input.missing()) {
+            bool inserted = _set.insert(input).second;
+            if (inserted) {
+                _memUsageBytes += input.getApproximateSize();
             }
         }
+    } else {
+        // If we're merging, we need to take apart the arrays we
+        // receive and put their elements into the array we are collecting.
+        // If we didn't, then we'd get an array of arrays, with one array
+        // from each merge source.
+        verify(input.getType() == Array);
 
-        return Value::getNull();
-    }
-
-    intrusive_ptr<const Value> AccumulatorAddToSet::getValue() const {
-        vector<intrusive_ptr<const Value> > valVec;
-
-        for (itr = set.begin(); itr != set.end(); ++itr) {
-            valVec.push_back(*itr);
+        const vector<Value>& array = input.getArray();
+        for (size_t i = 0; i < array.size(); i++) {
+            bool inserted = _set.insert(array[i]).second;
+            if (inserted) {
+                _memUsageBytes += array[i].getApproximateSize();
+            }
         }
-        /* there is no issue of scope since createArray copy constructs */
-        return Value::createArray(valVec);
-    }
-
-    AccumulatorAddToSet::AccumulatorAddToSet(
-        const intrusive_ptr<ExpressionContext> &pTheCtx):
-        Accumulator(),
-        set(),
-        pCtx(pTheCtx) {
-    }
-
-    intrusive_ptr<Accumulator> AccumulatorAddToSet::create(
-        const intrusive_ptr<ExpressionContext> &pCtx) {
-        intrusive_ptr<AccumulatorAddToSet> pAccumulator(
-            new AccumulatorAddToSet(pCtx));
-        return pAccumulator;
-    }
-
-    const char *AccumulatorAddToSet::getOpName() const {
-        return "$addToSet";
     }
 }
+
+Value AccumulatorAddToSet::getValue(bool toBeMerged) {
+    return Value(vector<Value>(_set.begin(), _set.end()));
+}
+
+AccumulatorAddToSet::AccumulatorAddToSet(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    : Accumulator(expCtx), _set(expCtx->getValueComparator().makeUnorderedValueSet()) {
+    _memUsageBytes = sizeof(*this);
+}
+
+void AccumulatorAddToSet::reset() {
+    _set = getExpressionContext()->getValueComparator().makeUnorderedValueSet();
+    _memUsageBytes = sizeof(*this);
+}
+
+intrusive_ptr<Accumulator> AccumulatorAddToSet::create(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    return new AccumulatorAddToSet(expCtx);
+}
+
+}  // namespace mongo

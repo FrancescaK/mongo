@@ -2,520 +2,595 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "pch.h"
-#include "engine.h"
-#include "../util/file.h"
-#include "../client/dbclient.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
+#include "mongo/platform/basic.h"
+
+#include "mongo/scripting/engine.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <cctype>
+
+#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclientinterface.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/unordered_set.h"
+#include "mongo/scripting/dbdirectclient_factory.h"
+#include "mongo/util/file.h"
+#include "mongo/util/log.h"
+#include "mongo/util/text.h"
 
 namespace mongo {
 
-    long long Scope::_lastVersion = 1;
+using std::set;
+using std::shared_ptr;
+using std::string;
+using std::unique_ptr;
 
-    int Scope::_numScopes = 0;
+AtomicInt64 Scope::_lastVersion(1);
 
-    Scope::Scope() : _localDBName("") , _loadedVersion(0), _numTimeUsed(0) {
-        _numScopes++;
-    }
+namespace {
+// 2 GB is the largest support Javascript file size.
+const fileofs kMaxJsFileLength = fileofs(2) * 1024 * 1024 * 1024;
 
-    Scope::~Scope() {
-        _numScopes--;
-    }
+const ServiceContext::Decoration<std::unique_ptr<ScriptEngine>> forService =
+    ServiceContext::declareDecoration<std::unique_ptr<ScriptEngine>>();
+static std::unique_ptr<ScriptEngine> globalScriptEngine;
 
-    ScriptEngine::ScriptEngine() : _scopeInitCallback() {
-    }
+}  // namespace
 
-    ScriptEngine::~ScriptEngine() {
-    }
+ScriptEngine::ScriptEngine() : _scopeInitCallback() {}
 
-    void Scope::append( BSONObjBuilder & builder , const char * fieldName , const char * scopeName ) {
-        int t = type( scopeName );
+ScriptEngine::~ScriptEngine() {}
 
-        switch ( t ) {
+Scope::Scope()
+    : _localDBName(""), _loadedVersion(0), _numTimesUsed(0), _lastRetIsNativeCode(false) {}
+
+Scope::~Scope() {}
+
+void Scope::append(BSONObjBuilder& builder, const char* fieldName, const char* scopeName) {
+    int t = type(scopeName);
+    switch (t) {
         case Object:
-            builder.append( fieldName , getObject( scopeName ) );
+            builder.append(fieldName, getObject(scopeName));
             break;
         case Array:
-            builder.appendArray( fieldName , getObject( scopeName ) );
+            builder.appendArray(fieldName, getObject(scopeName));
             break;
         case NumberDouble:
-            builder.append( fieldName , getNumber( scopeName ) );
+            builder.append(fieldName, getNumber(scopeName));
             break;
         case NumberInt:
-            builder.append( fieldName , getNumberInt( scopeName ) );
+            builder.append(fieldName, getNumberInt(scopeName));
             break;
         case NumberLong:
-            builder.append( fieldName , getNumberLongLong( scopeName ) );
+            builder.append(fieldName, getNumberLongLong(scopeName));
+            break;
+        case NumberDecimal:
+            builder.append(fieldName, getNumberDecimal(scopeName));
             break;
         case String:
-            builder.append( fieldName , getString( scopeName ).c_str() );
+            builder.append(fieldName, getString(scopeName));
             break;
         case Bool:
-            builder.appendBool( fieldName , getBoolean( scopeName ) );
+            builder.appendBool(fieldName, getBoolean(scopeName));
             break;
         case jstNULL:
         case Undefined:
-            builder.appendNull( fieldName );
+            builder.appendNull(fieldName);
             break;
         case Date:
-            // TODO: make signed
-            builder.appendDate( fieldName , Date_t((unsigned long long)getNumber( scopeName )) );
+            builder.appendDate(fieldName,
+                               Date_t::fromMillisSinceEpoch(getNumberLongLong(scopeName)));
             break;
         case Code:
-            builder.appendCode( fieldName , getString( scopeName ) );
+            builder.appendCode(fieldName, getString(scopeName));
             break;
         default:
-            stringstream temp;
-            temp << "can't append type from:";
-            temp << t;
-            uassert( 10206 ,  temp.str() , 0 );
-        }
-
-    }
-
-    int Scope::invoke( const char* code , const BSONObj* args, const BSONObj* recv, int timeoutMs ) {
-        ScriptingFunction func = createFunction( code );
-        uassert( 10207 ,  "compile failed" , func );
-        return invoke( func , args, recv, timeoutMs );
-    }
-
-    bool Scope::execFile( const string& filename , bool printResult , bool reportError , bool assertOnError, int timeoutMs ) {
-
-        boost::filesystem::path p( filename );
-
-        if ( ! exists( p ) ) {
-            log() << "file [" << filename << "] doesn't exist" << endl;
-            if ( assertOnError )
-                assert( 0 );
-            return false;
-        }
-
-        // iterate directories and recurse using all *.js files in the directory
-        if ( boost::filesystem::is_directory( p ) ) {
-            boost::filesystem::directory_iterator end;
-            bool empty = true;
-            for (boost::filesystem::directory_iterator it (p); it != end; it++) {
-                empty = false;
-                boost::filesystem::path sub(*it);
-                if (!endsWith(sub.string().c_str(), ".js"))
-                    continue;
-                if (!execFile(sub.string().c_str(), printResult, reportError, assertOnError, timeoutMs))
-                    return false;
-            }
-
-            if (empty) {
-                log() << "directory [" << filename << "] doesn't have any *.js files" << endl;
-                if ( assertOnError )
-                    assert( 0 );
-                return false;
-            }
-
-            return true;
-        }
-
-        File f;
-        f.open( filename.c_str() , true );
-
-        unsigned L;
-        {
-            fileofs fo = f.len();
-            assert( fo <= 0x7ffffffe );
-            L = (unsigned) fo;
-        }
-        boost::scoped_array<char> data (new char[L+1]);
-        data[L] = 0;
-        f.read( 0 , data.get() , L );
-
-        int offset = 0;
-        if (data[0] == '#' && data[1] == '!') {
-            const char* newline = strchr(data.get(), '\n');
-            if (! newline)
-                return true; // file of just shebang treated same as empty file
-            offset = newline - data.get();
-        }
-
-        StringData code (data.get() + offset, L - offset);
-
-        return exec( code , filename , printResult , reportError , assertOnError, timeoutMs );
-    }
-
-    void Scope::storedFuncMod() {
-        _lastVersion++;
-    }
-
-    void Scope::validateObjectIdString( const string &str ) {
-        massert( 10448 , "invalid object id: length", str.size() == 24 );
-
-        for ( string::size_type i=0; i<str.size(); i++ ) {
-            char c = str[i];
-            if ( ( c >= '0' && c <= '9' ) ||
-                    ( c >= 'a' && c <= 'f' ) ||
-                    ( c >= 'A' && c <= 'F' ) ) {
-                continue;
-            }
-            massert( 10430 ,  "invalid object id: not hex", false );
-        }
-    }
-
-    void Scope::loadStored( bool ignoreNotConnected ) {
-        if ( _localDBName.size() == 0 ) {
-            if ( ignoreNotConnected )
-                return;
-            uassert( 10208 ,  "need to have locallyConnected already" , _localDBName.size() );
-        }
-        if ( _loadedVersion == _lastVersion )
-            return;
-
-        _loadedVersion = _lastVersion;
-
-        string coll = _localDBName + ".system.js";
-
-        static DBClientBase * db = createDirectClient();
-        auto_ptr<DBClientCursor> c = db->query( coll , Query(), 0, 0, NULL, QueryOption_SlaveOk, 0 );
-        assert( c.get() );
-
-        set<string> thisTime;
-
-        while ( c->more() ) {
-            BSONObj o = c->nextSafe();
-
-            BSONElement n = o["_id"];
-            BSONElement v = o["value"];
-
-            uassert( 10209 ,  str::stream() << "name has to be a string: " << n  , n.type() == String );
-            uassert( 10210 ,  "value has to be set" , v.type() != EOO );
-
-            setElement( n.valuestr() , v );
-
-            thisTime.insert( n.valuestr() );
-            _storedNames.insert( n.valuestr() );
-
-        }
-
-        // --- remove things from scope that were removed
-
-        list<string> toremove;
-
-        for ( set<string>::iterator i=_storedNames.begin(); i!=_storedNames.end(); i++ ) {
-            string n = *i;
-            if ( thisTime.count( n ) == 0 )
-                toremove.push_back( n );
-        }
-
-        for ( list<string>::iterator i=toremove.begin(); i!=toremove.end(); i++ ) {
-            string n = *i;
-            _storedNames.erase( n );
-            execSetup( (string)"delete " + n , "clean up scope" );
-        }
-
-    }
-
-    ScriptingFunction Scope::createFunction( const char * code ) {
-        if ( code[0] == '/' && code [1] == '*' ) {
-            code += 2;
-            while ( code[0] && code[1] ) {
-                if ( code[0] == '*' && code[1] == '/' ) {
-                    code += 2;
-                    break;
-                }
-                code++;
-            }
-        }
-        map<string,ScriptingFunction>::iterator i = _cachedFunctions.find( code );
-        if ( i != _cachedFunctions.end() )
-            return i->second;
-        ScriptingFunction f = _createFunction( code );
-        _cachedFunctions[code] = f;
-        return f;
-    }
-
-    namespace JSFiles {
-        extern const JSFile collection;
-        extern const JSFile db;
-        extern const JSFile mongo;
-        extern const JSFile mr;
-        extern const JSFile query;
-        extern const JSFile utils;
-        extern const JSFile utils_sh;
-    }
-
-    void Scope::execCoreFiles() {
-        // keeping same order as in SConstruct
-        execSetup(JSFiles::utils);
-        execSetup(JSFiles::utils_sh);
-        execSetup(JSFiles::db);
-        execSetup(JSFiles::mongo);
-        execSetup(JSFiles::mr);
-        execSetup(JSFiles::query);
-        execSetup(JSFiles::collection);
-    }
-
-    typedef map< string , list<Scope*> > PoolToScopes;
-
-    class ScopeCache {
-    public:
-
-        ScopeCache() : _mutex("ScopeCache") {
-            _magic = 17;
-        }
-
-        ~ScopeCache() {
-            assert( _magic == 17 );
-            _magic = 1;
-
-            if ( inShutdown() )
-                return;
-
-            clear();
-        }
-
-        void done( const string& pool , Scope * s ) {
-            scoped_lock lk( _mutex );
-            list<Scope*> & l = _pools[pool];
-            bool oom = s->hasOutOfMemoryException();
-
-            // do not keep too many contexts, or use them for too long
-            if ( l.size() > 10 || s->getTimeUsed() > 100 || oom ) {
-                delete s;
-            }
-            else {
-                l.push_back( s );
-                s->reset();
-            }
-
-            if (oom) {
-                // out of mem, make some room
-                log() << "Clearing all idle JS contexts due to out of memory" << endl;
-                clear();
-            }
-        }
-
-        Scope * get( const string& pool ) {
-            scoped_lock lk( _mutex );
-            list<Scope*> & l = _pools[pool];
-            if ( l.size() == 0 )
-                return 0;
-
-            Scope * s = l.back();
-            l.pop_back();
-            s->reset();
-            s->incTimeUsed();
-            return s;
-        }
-
-        void clear() {
-            set<Scope*> seen;
-
-            for ( PoolToScopes::iterator i=_pools.begin() ; i != _pools.end(); i++ ) {
-                for ( list<Scope*>::iterator j=i->second.begin(); j != i->second.end(); j++ ) {
-                    Scope * s = *j;
-                    assert( ! seen.count( s ) );
-                    delete s;
-                    seen.insert( s );
-                }
-            }
-
-            _pools.clear();
-        }
-
-    private:
-        PoolToScopes _pools;
-        mongo::mutex _mutex;
-        int _magic;
-    };
-
-    thread_specific_ptr<ScopeCache> scopeCache;
-
-    class PooledScope : public Scope {
-    public:
-        PooledScope( const string pool , Scope * real ) : _pool( pool ) , _real( real ) {
-            _real->loadStored( true );
-        };
-        virtual ~PooledScope() {
-            ScopeCache * sc = scopeCache.get();
-            if ( sc ) {
-                sc->done( _pool , _real );
-                _real = 0;
-            }
-            else {
-                // this means that the Scope was killed from a different thread
-                // for example a cursor got timed out that has a $where clause
-                log(3) << "warning: scopeCache is empty!" << endl;
-                delete _real;
-                _real = 0;
-            }
-        }
-
-        void reset() {
-            _real->reset();
-        }
-        void init( const BSONObj * data ) {
-            _real->init( data );
-        }
-
-        void localConnect( const char * dbName ) {
-            _real->localConnect( dbName );
-        }
-        void externalSetup() {
-            _real->externalSetup();
-        }
-
-        double getNumber( const char *field ) {
-            return _real->getNumber( field );
-        }
-        string getString( const char *field ) {
-            return _real->getString( field );
-        }
-        bool getBoolean( const char *field ) {
-            return _real->getBoolean( field );
-        }
-        BSONObj getObject( const char *field ) {
-            return _real->getObject( field );
-        }
-
-        int type( const char *field ) {
-            return _real->type( field );
-        }
-
-        void setElement( const char *field , const BSONElement& val ) {
-            _real->setElement( field , val );
-        }
-        void setNumber( const char *field , double val ) {
-            _real->setNumber( field , val );
-        }
-        void setString( const char *field , const char * val ) {
-            _real->setString( field , val );
-        }
-        void setObject( const char *field , const BSONObj& obj , bool readOnly=true ) {
-            _real->setObject( field , obj , readOnly );
-        }
-        void setBoolean( const char *field , bool val ) {
-            _real->setBoolean( field , val );
-        }
-//        void setThis( const BSONObj * obj ) {
-//            _real->setThis( obj );
-//        }
-
-        void setFunction( const char *field , const char * code ) {
-            _real->setFunction(field, code);
-        }
-
-        ScriptingFunction createFunction( const char * code ) {
-            return _real->createFunction( code );
-        }
-
-        ScriptingFunction _createFunction( const char * code ) {
-            return _real->createFunction( code );
-        }
-
-        void rename( const char * from , const char * to ) {
-            _real->rename( from , to );
-        }
-
-        /**
-         * @return 0 on success
-         */
-        int invoke( ScriptingFunction func , const BSONObj* args, const BSONObj* recv, int timeoutMs , bool ignoreReturn, bool readOnlyArgs, bool readOnlyRecv ) {
-            return _real->invoke( func , args , recv, timeoutMs , ignoreReturn, readOnlyArgs, readOnlyRecv );
-        }
-
-        string getError() {
-            return _real->getError();
-        }
-
-        bool hasOutOfMemoryException() {
-            return _real->hasOutOfMemoryException();
-        }
-
-        bool exec( const StringData& code , const string& name , bool printResult , bool reportError , bool assertOnError, int timeoutMs = 0 ) {
-            return _real->exec( code , name , printResult , reportError , assertOnError , timeoutMs );
-        }
-        bool execFile( const string& filename , bool printResult , bool reportError , bool assertOnError, int timeoutMs = 0 ) {
-            return _real->execFile( filename , printResult , reportError , assertOnError , timeoutMs );
-        }
-
-        void injectNative( const char *field, NativeFunction func, void* data ) {
-            _real->injectNative( field , func, data );
-        }
-
-        void gc() {
-            _real->gc();
-        }
-
-        void append( BSONObjBuilder & builder , const char * fieldName , const char * scopeName ) {
-            _real->append(builder, fieldName, scopeName);
-        }
-
-    private:
-        string _pool;
-        Scope * _real;
-    };
-
-    auto_ptr<Scope> ScriptEngine::getPooledScope( const string& pool ) {
-        if ( ! scopeCache.get() ) {
-            scopeCache.reset( new ScopeCache() );
-        }
-
-        Scope * s = scopeCache->get( pool );
-        if ( ! s ) {
-            s = newScope();
-        }
-
-        auto_ptr<Scope> p;
-        p.reset( new PooledScope( pool , s ) );
-        return p;
-    }
-
-    void ScriptEngine::threadDone() {
-        ScopeCache * sc = scopeCache.get();
-        if ( sc ) {
-            sc->clear();
-        }
-    }
-
-    void ( *ScriptEngine::_connectCallback )( DBClientWithCommands & ) = 0;
-    const char * ( *ScriptEngine::_checkInterruptCallback )() = 0;
-    unsigned ( *ScriptEngine::_getInterruptSpecCallback )() = 0;
-
-    ScriptEngine * globalScriptEngine = 0;
-
-    bool hasJSReturn( const string& code ) {
-        size_t x = code.find( "return" );
-        if ( x == string::npos )
-            return false;
-
-        return
-            ( x == 0 || ! isalpha( code[x-1] ) ) &&
-            ! isalpha( code[x+6] );
-    }
-
-    const char * jsSkipWhiteSpace( const char * raw ) {
-        while ( raw[0] ) {
-            while (isspace(*raw)) {
-                raw++;
-            }
-
-            if ( raw[0] != '/' || raw[1] != '/' )
-                break;
-
-            while ( raw[0] && raw[0] != '\n' )
-                raw++;
-        }
-        return raw;
+            uassert(10206, str::stream() << "can't append type from: " << t, 0);
     }
 }
 
+int Scope::invoke(const char* code, const BSONObj* args, const BSONObj* recv, int timeoutMs) {
+    ScriptingFunction func = createFunction(code);
+    uassert(10207, "compile failed", func);
+    return invoke(func, args, recv, timeoutMs);
+}
+
+bool Scope::execFile(const string& filename, bool printResult, bool reportError, int timeoutMs) {
+#ifdef _WIN32
+    boost::filesystem::path p(toWideString(filename.c_str()));
+#else
+    boost::filesystem::path p(filename);
+#endif
+    if (!exists(p)) {
+        error() << "file [" << filename << "] doesn't exist";
+        return false;
+    }
+
+    // iterate directories and recurse using all *.js files in the directory
+    if (boost::filesystem::is_directory(p)) {
+        boost::filesystem::directory_iterator end;
+        bool empty = true;
+
+        for (boost::filesystem::directory_iterator it(p); it != end; it++) {
+            empty = false;
+            boost::filesystem::path sub(*it);
+            if (!str::endsWith(sub.string().c_str(), ".js"))
+                continue;
+            if (!execFile(sub.string(), printResult, reportError, timeoutMs))
+                return false;
+        }
+
+        if (empty) {
+            error() << "directory [" << filename << "] doesn't have any *.js files";
+            return false;
+        }
+
+        return true;
+    }
+
+    File f;
+    f.open(filename.c_str(), true);
+
+    if (!f.is_open() || f.bad())
+        return false;
+
+    fileofs fo = f.len();
+    if (fo > kMaxJsFileLength) {
+        warning() << "attempted to execute javascript file larger than 2GB";
+        return false;
+    }
+    unsigned len = static_cast<unsigned>(fo);
+    std::unique_ptr<char[]> data(new char[len + 1]);
+    data[len] = 0;
+    f.read(0, data.get(), len);
+
+    int offset = 0;
+    if (data[0] == '#' && data[1] == '!') {
+        const char* newline = strchr(data.get(), '\n');
+        if (!newline)
+            return true;  // file of just shebang treated same as empty file
+        offset = newline - data.get();
+    }
+
+    StringData code(data.get() + offset, len - offset);
+    return exec(code, filename, printResult, reportError, false, timeoutMs);
+}
+
+class Scope::StoredFuncModLogOpHandler : public RecoveryUnit::Change {
+public:
+    void commit() {
+        _lastVersion.fetchAndAdd(1);
+    }
+    void rollback() {}
+};
+
+void Scope::storedFuncMod(OperationContext* opCtx) {
+    opCtx->recoveryUnit()->registerChange(new StoredFuncModLogOpHandler());
+}
+
+void Scope::validateObjectIdString(const string& str) {
+    uassert(10448, "invalid object id: length", str.size() == 24);
+    for (size_t i = 0; i < str.size(); i++)
+        uassert(10430, "invalid object id: not hex", std::isxdigit(str.at(i)));
+}
+
+void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
+    if (_localDBName.size() == 0) {
+        if (ignoreNotConnected)
+            return;
+        uassert(10208, "need to have locallyConnected already", _localDBName.size());
+    }
+
+    int64_t lastVersion = _lastVersion.load();
+    if (_loadedVersion == lastVersion)
+        return;
+
+    _loadedVersion = lastVersion;
+    string coll = _localDBName + ".system.js";
+
+    auto directDBClient = DBDirectClientFactory::get(opCtx).create(opCtx);
+
+    unique_ptr<DBClientCursor> c =
+        directDBClient->query(coll, Query(), 0, 0, NULL, QueryOption_SlaveOk, 0);
+    massert(16669, "unable to get db client cursor from query", c.get());
+
+    set<string> thisTime;
+    while (c->more()) {
+        BSONObj o = c->nextSafe().getOwned();
+        BSONElement n = o["_id"];
+        BSONElement v = o["value"];
+
+        uassert(10209, str::stream() << "name has to be a string: " << n, n.type() == String);
+        uassert(10210, "value has to be set", v.type() != EOO);
+
+        try {
+            setElement(n.valuestr(), v, o);
+            thisTime.insert(n.valuestr());
+            _storedNames.insert(n.valuestr());
+        } catch (const DBException& setElemEx) {
+            if (setElemEx.getCode() == ErrorCodes::Interrupted) {
+                throw;
+            }
+
+            error() << "unable to load stored JavaScript function " << n.valuestr()
+                    << "(): " << redact(setElemEx);
+        }
+    }
+
+    // remove things from scope that were removed from the system.js collection
+    for (set<string>::iterator i = _storedNames.begin(); i != _storedNames.end();) {
+        if (thisTime.count(*i) == 0) {
+            string toDelete = str::stream() << "delete " << *i;
+            _storedNames.erase(i++);
+            execSetup(toDelete, "clean up scope");
+        } else {
+            ++i;
+        }
+    }
+}
+
+ScriptingFunction Scope::createFunction(const char* code) {
+    if (code[0] == '/' && code[1] == '*') {
+        code += 2;
+        while (code[0] && code[1]) {
+            if (code[0] == '*' && code[1] == '/') {
+                code += 2;
+                break;
+            }
+            code++;
+        }
+    }
+
+    FunctionCacheMap::iterator i = _cachedFunctions.find(code);
+    if (i != _cachedFunctions.end())
+        return i->second;
+
+    // Get a function number, so the cache can be utilized to lookup the source on an exception
+    ScriptingFunction functionNumber = _createFunction(code);
+    _cachedFunctions[code] = functionNumber;
+    return functionNumber;
+}
+
+namespace JSFiles {
+extern const JSFile collection;
+extern const JSFile crud_api;
+extern const JSFile db;
+extern const JSFile explain_query;
+extern const JSFile explainable;
+extern const JSFile mongo;
+extern const JSFile mr;
+extern const JSFile query;
+extern const JSFile utils;
+extern const JSFile utils_sh;
+extern const JSFile utils_auth;
+extern const JSFile bulk_api;
+extern const JSFile error_codes;
+}
+
+void Scope::execCoreFiles() {
+    execSetup(JSFiles::utils);
+    execSetup(JSFiles::utils_sh);
+    execSetup(JSFiles::utils_auth);
+    execSetup(JSFiles::db);
+    execSetup(JSFiles::mongo);
+    execSetup(JSFiles::mr);
+    execSetup(JSFiles::query);
+    execSetup(JSFiles::bulk_api);
+    execSetup(JSFiles::error_codes);
+    execSetup(JSFiles::collection);
+    execSetup(JSFiles::crud_api);
+    execSetup(JSFiles::explain_query);
+    execSetup(JSFiles::explainable);
+}
+
+namespace {
+class ScopeCache {
+public:
+    void release(const string& poolName, const std::shared_ptr<Scope>& scope) {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+        if (scope->hasOutOfMemoryException()) {
+            // make some room
+            log() << "Clearing all idle JS contexts due to out of memory";
+            _pools.clear();
+            return;
+        }
+
+        if (scope->getTimesUsed() > kMaxScopeReuse)
+            return;  // used too many times to save
+
+        if (!scope->getError().empty())
+            return;  // not saving errored scopes
+
+        if (_pools.size() >= kMaxPoolSize) {
+            // prefer to keep recently-used scopes
+            _pools.pop_back();
+        }
+
+        scope->reset();
+        ScopeAndPool toStore = {scope, poolName};
+        _pools.push_front(toStore);
+    }
+
+    std::shared_ptr<Scope> tryAcquire(OperationContext* opCtx, const string& poolName) {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+        for (Pools::iterator it = _pools.begin(); it != _pools.end(); ++it) {
+            if (it->poolName == poolName) {
+                std::shared_ptr<Scope> scope = it->scope;
+                _pools.erase(it);
+                scope->incTimesUsed();
+                scope->reset();
+                scope->registerOperation(opCtx);
+                return scope;
+            }
+        }
+
+        return std::shared_ptr<Scope>();
+    }
+
+    void clear() {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+        _pools.clear();
+    }
+
+private:
+    struct ScopeAndPool {
+        std::shared_ptr<Scope> scope;
+        string poolName;
+    };
+
+    // Note: if these numbers change, reconsider choice of datastructure for _pools
+    static const unsigned kMaxPoolSize = 10;
+    static const int kMaxScopeReuse = 10;
+
+    typedef std::deque<ScopeAndPool> Pools;  // More-recently used Scopes are kept at the front.
+    Pools _pools;                            // protected by _mutex
+    stdx::mutex _mutex;
+};
+
+ScopeCache scopeCache;
+}  // anonymous namespace
+
+void ScriptEngine::dropScopeCache() {
+    scopeCache.clear();
+}
+
+class PooledScope : public Scope {
+public:
+    PooledScope(const std::string& pool, const std::shared_ptr<Scope>& real)
+        : _pool(pool), _real(real) {}
+
+    virtual ~PooledScope() {
+        scopeCache.release(_pool, _real);
+    }
+
+    // wrappers for the derived (_real) scope
+    void reset() {
+        _real->reset();
+    }
+    void registerOperation(OperationContext* opCtx) {
+        _real->registerOperation(opCtx);
+    }
+    void unregisterOperation() {
+        _real->unregisterOperation();
+    }
+    void init(const BSONObj* data) {
+        _real->init(data);
+    }
+    void localConnectForDbEval(OperationContext* opCtx, const char* dbName) {
+        invariant(!"localConnectForDbEval should only be called from dbEval");
+    }
+    void setLocalDB(const string& dbName) {
+        _real->setLocalDB(dbName);
+    }
+    void loadStored(OperationContext* opCtx, bool ignoreNotConnected = false) {
+        _real->loadStored(opCtx, ignoreNotConnected);
+    }
+    void externalSetup() {
+        _real->externalSetup();
+    }
+    void gc() {
+        _real->gc();
+    }
+    void advanceGeneration() {
+        _real->advanceGeneration();
+    }
+    bool isKillPending() const {
+        return _real->isKillPending();
+    }
+    int type(const char* field) {
+        return _real->type(field);
+    }
+    string getError() {
+        return _real->getError();
+    }
+    bool hasOutOfMemoryException() {
+        return _real->hasOutOfMemoryException();
+    }
+    void rename(const char* from, const char* to) {
+        _real->rename(from, to);
+    }
+    double getNumber(const char* field) {
+        return _real->getNumber(field);
+    }
+    int getNumberInt(const char* field) {
+        return _real->getNumberInt(field);
+    }
+    long long getNumberLongLong(const char* field) {
+        return _real->getNumberLongLong(field);
+    }
+    Decimal128 getNumberDecimal(const char* field) {
+        return _real->getNumberDecimal(field);
+    }
+    string getString(const char* field) {
+        return _real->getString(field);
+    }
+    bool getBoolean(const char* field) {
+        return _real->getBoolean(field);
+    }
+    BSONObj getObject(const char* field) {
+        return _real->getObject(field);
+    }
+    void setNumber(const char* field, double val) {
+        _real->setNumber(field, val);
+    }
+    void setString(const char* field, StringData val) {
+        _real->setString(field, val);
+    }
+    void setElement(const char* field, const BSONElement& val, const BSONObj& parent) {
+        _real->setElement(field, val, parent);
+    }
+    void setObject(const char* field, const BSONObj& obj, bool readOnly = true) {
+        _real->setObject(field, obj, readOnly);
+    }
+    bool isLastRetNativeCode() {
+        return _real->isLastRetNativeCode();
+    }
+
+    void setBoolean(const char* field, bool val) {
+        _real->setBoolean(field, val);
+    }
+    void setFunction(const char* field, const char* code) {
+        _real->setFunction(field, code);
+    }
+    ScriptingFunction createFunction(const char* code) {
+        return _real->createFunction(code);
+    }
+    int invoke(ScriptingFunction func,
+               const BSONObj* args,
+               const BSONObj* recv,
+               int timeoutMs,
+               bool ignoreReturn,
+               bool readOnlyArgs,
+               bool readOnlyRecv) {
+        return _real->invoke(func, args, recv, timeoutMs, ignoreReturn, readOnlyArgs, readOnlyRecv);
+    }
+    bool exec(StringData code,
+              const string& name,
+              bool printResult,
+              bool reportError,
+              bool assertOnError,
+              int timeoutMs = 0) {
+        return _real->exec(code, name, printResult, reportError, assertOnError, timeoutMs);
+    }
+    bool execFile(const string& filename, bool printResult, bool reportError, int timeoutMs = 0) {
+        return _real->execFile(filename, printResult, reportError, timeoutMs);
+    }
+    void injectNative(const char* field, NativeFunction func, void* data) {
+        _real->injectNative(field, func, data);
+    }
+    void append(BSONObjBuilder& builder, const char* fieldName, const char* scopeName) {
+        _real->append(builder, fieldName, scopeName);
+    }
+
+protected:
+    ScriptingFunction _createFunction(const char* code) {
+        return _real->_createFunction(code);
+    }
+
+private:
+    string _pool;
+    std::shared_ptr<Scope> _real;
+};
+
+/** Get a scope from the pool of scopes matching the supplied pool name */
+unique_ptr<Scope> ScriptEngine::getPooledScope(OperationContext* opCtx,
+                                               const string& db,
+                                               const string& scopeType) {
+    const string fullPoolName = db + scopeType;
+    std::shared_ptr<Scope> s = scopeCache.tryAcquire(opCtx, fullPoolName);
+    if (!s) {
+        s.reset(newScope());
+        s->registerOperation(opCtx);
+    }
+
+    unique_ptr<Scope> p;
+    p.reset(new PooledScope(fullPoolName, s));
+    p->setLocalDB(db);
+    p->loadStored(opCtx, true);
+    return p;
+}
+
+void (*ScriptEngine::_connectCallback)(DBClientWithCommands&) = 0;
+
+ScriptEngine* getGlobalScriptEngine() {
+    if (hasGlobalServiceContext())
+        return forService(getGlobalServiceContext()).get();
+    else
+        return globalScriptEngine.get();
+}
+
+void setGlobalScriptEngine(ScriptEngine* impl) {
+    if (hasGlobalServiceContext())
+        forService(getGlobalServiceContext()).reset(impl);
+    else
+        globalScriptEngine.reset(impl);
+}
+
+bool hasJSReturn(const string& code) {
+    size_t x = code.find("return");
+    if (x == string::npos)
+        return false;
+
+    int quoteCount = 0;
+    int singleQuoteCount = 0;
+    for (size_t i = 0; i < x; i++) {
+        if (code[i] == '"') {
+            quoteCount++;
+        } else if (code[i] == '\'') {
+            singleQuoteCount++;
+        }
+    }
+    // if we are in either single quotes or double quotes return false
+    if (quoteCount % 2 != 0 || singleQuoteCount % 2 != 0) {
+        return false;
+    }
+
+    // return is at start OR preceded by space
+    // AND return is not followed by digit or letter
+    return (x == 0 || isspace(code[x - 1])) && !(isalpha(code[x + 6]) || isdigit(code[x + 6]));
+}
+
+const char* jsSkipWhiteSpace(const char* raw) {
+    while (raw[0]) {
+        while (isspace(*raw)) {
+            ++raw;
+        }
+        if (raw[0] != '/' || raw[1] != '/')
+            break;
+        while (raw[0] && raw[0] != '\n')
+            raw++;
+    }
+    return raw;
+}
+}

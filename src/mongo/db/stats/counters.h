@@ -13,147 +13,103 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include "../../pch.h"
-#include "../jsobj.h"
-#include "../../util/net/message.h"
-#include "../../util/processinfo.h"
-#include "../../util/concurrency/spin_lock.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/basic.h"
+#include "mongo/util/concurrency/spin_lock.h"
+#include "mongo/util/net/message.h"
+#include "mongo/util/processinfo.h"
 
 namespace mongo {
 
-    /**
-     * for storing operation counters
-     * note: not thread safe.  ok with that for speed
-     */
-    class OpCounters {
-    public:
+/**
+ * for storing operation counters
+ * note: not thread safe.  ok with that for speed
+ */
+class OpCounters {
+public:
+    OpCounters();
+    void gotInserts(int n);
+    void gotInsert();
+    void gotQuery();
+    void gotUpdate();
+    void gotDelete();
+    void gotGetMore();
+    void gotCommand();
 
-        OpCounters();
+    void gotOp(int op, bool isCommand);
 
-        AtomicUInt * getInsert() { return _insert; }
-        AtomicUInt * getQuery() { return _query; }
-        AtomicUInt * getUpdate() { return _update; }
-        AtomicUInt * getDelete() { return _delete; }
-        AtomicUInt * getGetMore() { return _getmore; }
-        AtomicUInt * getCommand() { return _command; }
+    BSONObj getObj() const;
 
-        void incInsertInWriteLock(int n) { _insert->x += n; }
-        void gotInsert() { _insert[0]++; }
-        void gotQuery() { _query[0]++; }
-        void gotUpdate() { _update[0]++; }
-        void gotDelete() { _delete[0]++; }
-        void gotGetMore() { _getmore[0]++; }
-        void gotCommand() { _command[0]++; }
+    // thse are used by snmp, and other things, do not remove
+    const AtomicUInt32* getInsert() const {
+        return &_insert;
+    }
+    const AtomicUInt32* getQuery() const {
+        return &_query;
+    }
+    const AtomicUInt32* getUpdate() const {
+        return &_update;
+    }
+    const AtomicUInt32* getDelete() const {
+        return &_delete;
+    }
+    const AtomicUInt32* getGetMore() const {
+        return &_getmore;
+    }
+    const AtomicUInt32* getCommand() const {
+        return &_command;
+    }
 
-        void gotOp( int op , bool isCommand );
+private:
+    void _checkWrap();
 
-        BSONObj& getObj();
+    // todo: there will be a lot of cache line contention on these.  need to do something
+    //       else eventually.
+    AtomicUInt32 _insert;
+    AtomicUInt32 _query;
+    AtomicUInt32 _update;
+    AtomicUInt32 _delete;
+    AtomicUInt32 _getmore;
+    AtomicUInt32 _command;
+};
 
-    private:
-        BSONObj _obj;
+extern OpCounters globalOpCounters;
+extern OpCounters replOpCounters;
 
-        // todo: there will be a lot of cache line contention on these.  need to do something 
-        //       else eventually.
-        AtomicUInt * _insert;
-        AtomicUInt * _query;
-        AtomicUInt * _update;
-        AtomicUInt * _delete;
-        AtomicUInt * _getmore;
-        AtomicUInt * _command;
-    };
+class NetworkCounter {
+public:
+    // Increment the counters for the number of bytes read directly off the wire
+    void hitPhysical(long long bytesIn, long long bytesOut);
+    // Increment the counters for the number of bytes passed out of the TransportLayer to the
+    // server
+    void hitLogical(long long bytesIn, long long bytesOut);
+    void append(BSONObjBuilder& b);
 
-    extern OpCounters globalOpCounters;
-    extern OpCounters replOpCounters;
+private:
+    AtomicInt64 _physicalBytesIn{0};
+    AtomicInt64 _physicalBytesOut{0};
+    AtomicInt64 _logicalBytesIn{0};
+    AtomicInt64 _logicalBytesOut{0};
 
+    AtomicInt64 _requests{0};
+};
 
-    class IndexCounters {
-    public:
-        IndexCounters();
-
-        // used without a mutex intentionally (can race)
-        void btree( char * node ) {
-            if ( ! _memSupported )
-                return;
-            if ( _sampling++ % _samplingrate )
-                return;
-            btree( _pi.blockInMemory( node ) );
-        }
-
-        void btree( bool memHit ) {
-            if ( memHit )
-                _btreeMemHits++;
-            else
-                _btreeMemMisses++;
-            _btreeAccesses++;
-        }
-        void btreeHit() { _btreeMemHits++; _btreeAccesses++; }
-        void btreeMiss() { _btreeMemMisses++; _btreeAccesses++; }
-
-        void append( BSONObjBuilder& b );
-
-    private:
-        ProcessInfo _pi;
-        bool _memSupported;
-
-        int _sampling;
-        int _samplingrate;
-
-        int _resets;
-        long long _maxAllowed;
-
-        long long _btreeMemMisses;
-        long long _btreeMemHits;
-        long long _btreeAccesses;
-    };
-
-    extern IndexCounters globalIndexCounters;
-
-    class FlushCounters {
-    public:
-        FlushCounters();
-
-        void flushed(int ms);
-
-        void append( BSONObjBuilder& b );
-
-    private:
-        long long _total_time;
-        long long _flushes;
-        int _last_time;
-        Date_t _last;
-    };
-
-    extern FlushCounters globalFlushCounters;
-
-
-    class GenericCounter {
-    public:
-        GenericCounter() : _mutex("GenericCounter") { }
-        void hit( const string& name , int count=0 );
-        BSONObj getObj();
-    private:
-        map<string,long long> _counts; // TODO: replace with thread safe map
-        mongo::mutex _mutex;
-    };
-
-    class NetworkCounter {
-    public:
-        NetworkCounter() : _bytesIn(0), _bytesOut(0), _requests(0), _overflows(0) {}
-        void hit( long long bytesIn , long long bytesOut );
-        void append( BSONObjBuilder& b );
-    private:
-        long long _bytesIn;
-        long long _bytesOut;
-        long long _requests;
-
-        long long _overflows;
-
-        SpinLock _lock;
-    };
-
-    extern NetworkCounter networkCounter;
+extern NetworkCounter networkCounter;
 }

@@ -14,28 +14,42 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #pragma once
 
-#include "diskloc.h"
-#include "jsobj.h"
-#include "namespace-inl.h"
-#include "../util/net/message.h"
-#include "../client/constants.h"
-#include "instance.h"
+#include "mongo/base/static_assert.h"
+#include "mongo/bson/bson_validate.h"
+#include "mongo/client/constants.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/server_options.h"
+#include "mongo/util/net/message.h"
 
 namespace mongo {
 
-    /* db response format
+class OperationContext;
 
-       Query or GetMore: // see struct QueryResult
-          int resultFlags;
-          int64 cursorID;
-          int startingFrom;
-          int nReturned;
-          list of marshalled JSObjects;
-    */
+/* db response format
+
+   Query or GetMore: // see struct QueryResult
+      int resultFlags;
+      int64 cursorID;
+      int startingFrom;
+      int nReturned;
+      list of marshalled JSObjects;
+*/
 
 /* db request message format
 
@@ -46,28 +60,29 @@ namespace mongo {
    then for:
 
    dbInsert:
-      string collection;
+      std::string collection;
       a series of JSObjects
    dbDelete:
-      string collection;
+      std::string collection;
       int flags=0; // 1=DeleteSingle
       JSObject query;
    dbUpdate:
-      string collection;
+      std::string collection;
       int flags; // 1=upsert
       JSObject query;
       JSObject objectToUpdate;
         objectToUpdate may include { $inc: <field> } or { $set: ... }, see struct Mod.
    dbQuery:
-      string collection;
+      std::string collection;
       int nToSkip;
       int nToReturn; // how many you want back as the beginning of the cursor data (0=no limit)
-                     // greater than zero is simply a hint on how many objects to send back per "cursor batch".
+                     // greater than zero is simply a hint on how many objects to send back per
+                     // "cursor batch".
                      // a negative number indicates a hard limit.
       JSObject query;
       [JSObject fieldsToReturn]
    dbGetMore:
-      string collection; // redundant, might use for security.
+      std::string collection; // redundant, might use for security.
       int nToReturn;
       int64 cursorID;
    dbKillCursors=2007:
@@ -79,204 +94,290 @@ namespace mongo {
    Note that the update field layout is very similar layout to Query.
 */
 
-
+namespace QueryResult {
 #pragma pack(1)
-    struct QueryResult : public MsgData {
-        long long cursorId;
-        int startingFrom;
-        int nReturned;
-        const char *data() {
-            return (char *) (((int *)&nReturned)+1);
-        }
-        int resultFlags() {
-            return dataAsInt();
-        }
-        int& _resultFlags() {
-            return dataAsInt();
-        }
-        void setResultFlagsToOk() {
-            _resultFlags() = ResultFlag_AwaitCapable;
-        }
-        void initializeResultFlags() {
-            _resultFlags() = 0;   
-        }
-    };
-
+/* see http://dochub.mongodb.org/core/mongowireprotocol
+*/
+struct Layout {
+    MsgData::Layout msgdata;
+    int64_t cursorId;
+    int32_t startingFrom;
+    int32_t nReturned;
+};
 #pragma pack()
 
-    /* For the database/server protocol, these objects and functions encapsulate
-       the various messages transmitted over the connection.
+class ConstView {
+public:
+    ConstView(const char* storage) : _storage(storage) {}
 
-       See http://www.mongodb.org/display/DOCS/Mongo+Wire+Protocol
-    */
-    class DbMessage {
-    public:
-        DbMessage(const Message& _m) : m(_m) , mark(0) {
-            // for received messages, Message has only one buffer
-            theEnd = _m.singleData()->_data + _m.header()->dataLen();
-            char *r = _m.singleData()->_data;
-            reserved = (int *) r;
-            data = r + 4;
-            nextjsobj = data;
+    const char* view2ptr() const {
+        return storage().view();
+    }
+
+    MsgData::ConstView msgdata() const {
+        return storage().view(offsetof(Layout, msgdata));
+    }
+
+    int64_t getCursorId() const {
+        return storage().read<LittleEndian<int64_t>>(offsetof(Layout, cursorId));
+    }
+
+    int32_t getStartingFrom() const {
+        return storage().read<LittleEndian<int32_t>>(offsetof(Layout, startingFrom));
+    }
+
+    int32_t getNReturned() const {
+        return storage().read<LittleEndian<int32_t>>(offsetof(Layout, nReturned));
+    }
+
+    const char* data() const {
+        return storage().view(sizeof(Layout));
+    }
+
+    int32_t dataLen() const {
+        return msgdata().getLen() - sizeof(Layout);
+    }
+
+protected:
+    const ConstDataView& storage() const {
+        return _storage;
+    }
+
+private:
+    ConstDataView _storage;
+};
+
+class View : public ConstView {
+public:
+    View(char* data) : ConstView(data) {}
+
+    using ConstView::view2ptr;
+    char* view2ptr() {
+        return storage().view();
+    }
+
+    using ConstView::msgdata;
+    MsgData::View msgdata() {
+        return storage().view(offsetof(Layout, msgdata));
+    }
+
+    void setCursorId(int64_t value) {
+        storage().write(tagLittleEndian(value), offsetof(Layout, cursorId));
+    }
+
+    void setStartingFrom(int32_t value) {
+        storage().write(tagLittleEndian(value), offsetof(Layout, startingFrom));
+    }
+
+    void setNReturned(int32_t value) {
+        storage().write(tagLittleEndian(value), offsetof(Layout, nReturned));
+    }
+
+    int32_t getResultFlags() {
+        return DataView(msgdata().data()).read<LittleEndian<int32_t>>();
+    }
+
+    void setResultFlags(int32_t value) {
+        DataView(msgdata().data()).write(tagLittleEndian(value));
+    }
+
+    void setResultFlagsToOk() {
+        setResultFlags(ResultFlag_AwaitCapable);
+    }
+
+    void initializeResultFlags() {
+        setResultFlags(0);
+    }
+
+private:
+    DataView storage() const {
+        return const_cast<char*>(ConstView::view2ptr());
+    }
+};
+
+class Value : public EncodedValueStorage<Layout, ConstView, View> {
+public:
+    Value() {
+        MONGO_STATIC_ASSERT(sizeof(Value) == sizeof(Layout));
+    }
+
+    Value(ZeroInitTag_t zit) : EncodedValueStorage<Layout, ConstView, View>(zit) {}
+};
+
+}  // namespace QueryResult
+
+/* For the database/server protocol, these objects and functions encapsulate
+   the various messages transmitted over the connection.
+
+   See http://dochub.mongodb.org/core/mongowireprotocol
+*/
+class DbMessage {
+    // Assume sizeof(int) == 4 bytes
+    MONGO_STATIC_ASSERT(sizeof(int) == 4);
+
+public:
+    // Note: DbMessage constructor reads the first 4 bytes and stores it in reserved
+    DbMessage(const Message& msg);
+
+    // Indicates whether this message is expected to have a ns
+    bool messageShouldHaveNs() const {
+        return (_msg.operation() >= dbUpdate) & (_msg.operation() <= dbDelete);
+    }
+
+    /** the 32 bit field before the ns
+     * track all bit usage here as its cross op
+     * 0: InsertOption_ContinueOnError
+     * 1: fromWriteback
+     */
+    int reservedField() const {
+        return _reserved;
+    }
+
+    const char* getns() const;
+    int getQueryNToReturn() const;
+
+    int pullInt();
+    long long pullInt64();
+    const char* getArray(size_t count) const;
+
+    /* for insert and update msgs */
+    bool moreJSObjs() const {
+        return _nextjsobj != 0 && _nextjsobj != _theEnd;
+    }
+
+    BSONObj nextJsObj();
+
+    const Message& msg() const {
+        return _msg;
+    }
+
+    const char* markGet() const {
+        return _nextjsobj;
+    }
+
+    void markSet() {
+        _mark = _nextjsobj;
+    }
+
+    void markReset(const char* toMark);
+
+private:
+    // Check if we have enough data to read
+    template <typename T>
+    void checkRead(const char* start, size_t count = 0) const;
+
+    // Read some type without advancing our position
+    template <typename T>
+    T read() const;
+
+    // Read some type, and advance our position
+    template <typename T>
+    T readAndAdvance();
+
+    const Message& _msg;
+    int _reserved;  // flags or zero depending on packet, starts the packet
+
+    const char* _nsStart;    // start of namespace string, +4 from message start
+    const char* _nextjsobj;  // current position reading packet
+    const char* _theEnd;     // end of packet
+
+    const char* _mark;
+
+    unsigned int _nsLen;
+};
+
+
+/* a request to run a query, received from the database */
+class QueryMessage {
+public:
+    const char* ns;
+    int ntoskip;
+    int ntoreturn;
+    int queryOptions;
+    BSONObj query;
+    BSONObj fields;
+
+    /**
+     * parses the message into the above fields
+     * Warning: constructor mutates DbMessage.
+     */
+    QueryMessage(DbMessage& d) {
+        ns = d.getns();
+        ntoskip = d.pullInt();
+        ntoreturn = d.pullInt();
+        query = d.nextJsObj();
+        if (d.moreJSObjs()) {
+            fields = d.nextJsObj();
         }
+        queryOptions = DataView(d.msg().header().data()).read<LittleEndian<int32_t>>();
+    }
+};
 
-        /** the 32 bit field before the ns 
-         * track all bit usage here as its cross op
-         * 0: InsertOption_ContinueOnError
-         * 1: fromWriteback
-         */
-        int& reservedField() { return *reserved; }
+/**
+ * A response to a DbMessage.
+ *
+ * Order of fields makes DbResponse{funcReturningMessage()} valid.
+ */
+struct DbResponse {
+    Message response;       // If empty, nothing will be returned to the client.
+    std::string exhaustNS;  // Namespace of cursor if exhaust mode, else "".
+};
 
-        const char * getns() const {
-            return data;
-        }
-        void getns(Namespace& ns) const {
-            ns = data;
-        }
+/**
+ * Prepares query replies to legacy finds (opReply to dbQuery) in place. This is also used for
+ * command responses that don't use the new dbCommand protocol.
+ */
+class OpQueryReplyBuilder {
+    MONGO_DISALLOW_COPYING(OpQueryReplyBuilder);
 
-        const char * afterNS() const {
-            return data + strlen( data ) + 1;
-        }
+public:
+    OpQueryReplyBuilder();
 
-        int getInt( int num ) const {
-            const int * foo = (const int*)afterNS();
-            return foo[num];
-        }
+    /**
+     * Returns the BufBuilder that should be used for placing result objects. It will be positioned
+     * where the first (or next) object should go.
+     *
+     * You must finish the BSONObjBuilder that uses this (by destruction or calling doneFast())
+     * before calling any more methods on this object.
+     */
+    BufBuilder& bufBuilderForResults() {
+        return _buffer;
+    }
 
-        int getQueryNToReturn() const {
-            return getInt( 1 );
-        }
+    /**
+     * Finishes the reply and returns the message buffer.
+     */
+    Message toQueryReply(int queryResultFlags,
+                         int nReturned,
+                         int startingFrom = 0,
+                         long long cursorId = 0);
 
-        /**
-         * get an int64 at specified offsetBytes after ns
-         */
-        long long getInt64( int offsetBytes ) const {
-            const char * x = afterNS();
-            x += offsetBytes;
-            const long long * ll = (const long long*)x;
-            return ll[0];
-        }
+    /**
+     * Similar to toQueryReply() but used for replying to a command.
+     */
+    Message toCommandReply() {
+        return toQueryReply(0, 1);
+    }
 
-        void resetPull() { nextjsobj = data; }
-        int pullInt() const { return pullInt(); }
-        int& pullInt() {
-            if ( nextjsobj == data )
-                nextjsobj += strlen(data) + 1; // skip namespace
-            int& i = *((int *)nextjsobj);
-            nextjsobj += 4;
-            return i;
-        }
-        long long pullInt64() const {
-            return pullInt64();
-        }
-        long long &pullInt64() {
-            if ( nextjsobj == data )
-                nextjsobj += strlen(data) + 1; // skip namespace
-            long long &i = *((long long *)nextjsobj);
-            nextjsobj += 8;
-            return i;
-        }
+private:
+    BufBuilder _buffer;
+};
 
-        OID* getOID() const {
-            return (OID *) (data + strlen(data) + 1); // skip namespace
-        }
-
-        void getQueryStuff(const char *&query, int& ntoreturn) {
-            int *i = (int *) (data + strlen(data) + 1);
-            ntoreturn = *i;
-            i++;
-            query = (const char *) i;
-        }
-
-        /* for insert and update msgs */
-        bool moreJSObjs() const {
-            return nextjsobj != 0;
-        }
-        BSONObj nextJsObj() {
-            if ( nextjsobj == data ) {
-                nextjsobj += strlen(data) + 1; // skip namespace
-                massert( 13066 ,  "Message contains no documents", theEnd > nextjsobj );
-            }
-            massert( 10304 ,  "Client Error: Remaining data too small for BSON object", theEnd - nextjsobj > 3 );
-            BSONObj js(nextjsobj);
-            massert( 10305 ,  "Client Error: Invalid object size", js.objsize() > 3 );
-            massert( 10306 ,  "Client Error: Next object larger than space left in message",
-                     js.objsize() < ( theEnd - data ) );
-            if ( cmdLine.objcheck && !js.valid() ) {
-                massert( 10307 , "Client Error: bad object in message", false);
-            }
-            nextjsobj += js.objsize();
-            if ( nextjsobj >= theEnd )
-                nextjsobj = 0;
-            return js;
-        }
-
-        const Message& msg() const { return m; }
-
-        void markSet() {
-            mark = nextjsobj;
-        }
-
-        void markReset() {
-            assert( mark );
-            nextjsobj = mark;
-        }
-
-    private:
-        const Message& m;
-        int* reserved;
-        const char *data;
-        const char *nextjsobj;
-        const char *theEnd;
-
-        const char * mark;
-
-    public:
-        enum ReservedOptions {
-            Reserved_InsertOption_ContinueOnError = 1 << 0 , 
-            Reserved_FromWriteback = 1 << 1 
-        };
-    };
+/**
+ * Helper to build a DbResponse from a buffer containing an OP_QUERY response.
+ */
+DbResponse replyToQuery(int queryResultFlags,
+                        const void* data,
+                        int size,
+                        int nReturned,
+                        int startingFrom = 0,
+                        long long cursorId = 0);
 
 
-    /* a request to run a query, received from the database */
-    class QueryMessage {
-    public:
-        const char *ns;
-        int ntoskip;
-        int ntoreturn;
-        int queryOptions;
-        BSONObj query;
-        BSONObj fields;
-
-        /* parses the message into the above fields */
-        QueryMessage(DbMessage& d) {
-            ns = d.getns();
-            ntoskip = d.pullInt();
-            ntoreturn = d.pullInt();
-            query = d.nextJsObj();
-            if ( d.moreJSObjs() ) {
-                fields = d.nextJsObj();
-            }
-            queryOptions = d.msg().header()->dataAsInt();
-        }
-    };
-
-    void replyToQuery(int queryResultFlags,
-                      AbstractMessagingPort* p, Message& requestMsg,
-                      void *data, int size,
-                      int nReturned, int startingFrom = 0,
-                      long long cursorId = 0
-                      );
-
-
-    /* object reply helper. */
-    void replyToQuery(int queryResultFlags,
-                      AbstractMessagingPort* p, Message& requestMsg,
-                      BSONObj& responseObj);
-
-    /* helper to do a reply using a DbResponse object */
-    void replyToQuery(int queryResultFlags, Message &m, DbResponse &dbresponse, BSONObj obj);
-
-
-} // namespace mongo
+/**
+ * Helper to build a DbRespose for OP_QUERY with a single reply object.
+ */
+inline DbResponse replyToQuery(const BSONObj& obj, int queryResultFlags = 0) {
+    return replyToQuery(queryResultFlags, obj.objdata(), obj.objsize(), /*nReturned*/ 1);
+}
+}  // namespace mongo

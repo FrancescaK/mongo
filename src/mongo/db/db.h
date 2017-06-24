@@ -1,3 +1,4 @@
+
 /**
 *    Copyright (C) 2008 10gen Inc.
 *
@@ -12,107 +13,33 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #pragma once
 
-#include "../pch.h"
-#include "../util/net/message.h"
-#include "mongomutex.h"
-#include "pdfile.h"
-#include "curop.h"
-#include "client.h"
-#include "databaseholder.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/curop.h"
+#include "mongo/util/net/message.h"
 
 namespace mongo {
 
-    struct dbtemprelease {
-        Client::Context * _context;
-        int _locktype;
+namespace repl {
+class ReplSettings;
+}  // namespace repl
 
-        dbtemprelease() {
-            const Client& c = cc();
-            _context = c.getContext();
-            _locktype = d.dbMutex.getState();
-            assert( _locktype );
-
-            if ( _locktype > 0 ) {
-                massert( 10298 , "can't temprelease nested write lock", _locktype == 1);
-                if ( _context ) _context->unlocked();
-                d.dbMutex.unlock();
-            }
-            else {
-                massert( 10299 , "can't temprelease nested read lock", _locktype == -1);
-                if ( _context ) _context->unlocked();
-                d.dbMutex.unlock_shared();
-            }
-            
-            verify( 14814 , c.curop() );
-            c.curop()->yielded();
-            
-        }
-        ~dbtemprelease() {
-            if ( _locktype > 0 )
-                d.dbMutex.lock();
-            else
-                d.dbMutex.lock_shared();
-
-            if ( _context ) _context->relocked();
-        }
-    };
-
-    /** must be write locked
-        no assert (and no release) if nested write lock 
-        a lot like dbtempreleasecond but no malloc so should be a tiny bit faster
-    */
-    struct dbtempreleasewritelock {
-        Client::Context * _context;
-        int _locktype;
-        dbtempreleasewritelock() {
-            const Client& c = cc();
-            _context = c.getContext();
-            _locktype = d.dbMutex.getState();
-            assert( _locktype >= 1 );
-            if( _locktype > 1 ) 
-                return; // nested
-            if ( _context ) 
-                _context->unlocked();
-            d.dbMutex.unlock();
-            verify( 14845 , c.curop() );
-            c.curop()->yielded();            
-        }
-        ~dbtempreleasewritelock() {
-            if ( _locktype == 1 )
-                d.dbMutex.lock();
-            if ( _context ) 
-                _context->relocked();
-        }
-    };
-
-    /**
-       only does a temp release if we're not nested and have a lock
-     */
-    struct dbtempreleasecond {
-        dbtemprelease * real;
-        int locktype;
-
-        dbtempreleasecond() {
-            real = 0;
-            locktype = d.dbMutex.getState();
-            if ( locktype == 1 || locktype == -1 )
-                real = new dbtemprelease();
-        }
-
-        ~dbtempreleasecond() {
-            if ( real ) {
-                delete real;
-                real = 0;
-            }
-        }
-
-        bool unlocked() {
-            return real != 0;
-        }
-    };
-
-} // namespace mongo
+}  // namespace mongo

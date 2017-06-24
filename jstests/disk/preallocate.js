@@ -1,30 +1,49 @@
-// check that there is preallocation on explicit createCollection() and no unncessary preallocation after restart
+// check that there is preallocation, and there are 2 files
 
-port = allocatePorts( 1 )[ 0 ];
+// Preallocation is an mmap only behavior.
+// @tags: [requires_mmapv1]
 
 var baseName = "jstests_preallocate";
 
-var m = startMongod( "--port", port, "--dbpath", "/data/db/" + baseName );
+var m = MongoRunner.runMongod({});
 
-assert.eq( 0, m.getDBs().totalSize );
+var getTotalNonLocalNonAdminSize = function() {
+    var totalNonLocalNonAdminDBSize = 0;
+    m.getDBs().databases.forEach(function(dbStats) {
+        // We accept the local database's and admin database's space overhead.
+        if (dbStats.name == "local" || dbStats.name == "admin")
+            return;
 
-m.getDB( baseName ).createCollection( baseName + "1" );
+        // Databases with "sizeOnDisk=1" and "empty=true" dont' actually take up space o disk.
+        // See SERVER-11051.
+        if (dbStats.sizeOnDisk == 1 && dbStats.empty)
+            return;
+        totalNonLocalNonAdminDBSize += dbStats.sizeOnDisk;
+    });
+    return totalNonLocalNonAdminDBSize;
+};
+
+assert.eq(0, getTotalNonLocalNonAdminSize());
+
+m.getDB(baseName).createCollection(baseName + "1");
 
 // Windows does not currently use preallocation
-expectedMB = ( _isWindows() ? 70 : 100 );
-if ( m.getDB( baseName ).serverBits() < 64 )
+expectedMB = 64 + 16;
+if (m.getDB(baseName).serverBits() < 64)
     expectedMB /= 4;
 
-assert.soon( function() { return m.getDBs().totalSize > expectedMB * 1000000; }, "\n\n\nFAIL preallocate.js expected second file to bring total size over " + expectedMB + "MB" );
+assert.soon(function() {
+    return getTotalNonLocalNonAdminSize() >= expectedMB * 1024 * 1024;
+}, "\n\n\nFAIL preallocate.js expected second file to bring total size over " + expectedMB + "MB");
 
-stopMongod( port );
+MongoRunner.stopMongod(m);
 
-var m = startMongoProgram( "mongod", "--port", port, "--dbpath", "/data/db/" + baseName );
+m = MongoRunner.runMongod({restart: true, cleanData: false, dbpath: m.dbpath});
 
-size = m.getDBs().totalSize;
+size = getTotalNonLocalNonAdminSize();
 
-m.getDB( baseName ).createCollection( baseName + "2" );
+m.getDB(baseName).createCollection(baseName + "2");
 
-sleep( 2000 ); // give prealloc a chance
+sleep(2000);  // give prealloc a chance
 
-assert.eq( size, m.getDBs().totalSize );
+assert.eq(size, getTotalNonLocalNonAdminSize());

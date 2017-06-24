@@ -2,138 +2,107 @@
 
 /*    Copyright 2010 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #pragma once
 
+#include <ctype.h>
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "mongo/base/string_data.h"
+
 namespace mongo {
 
-    // see also mongoutils/str.h - perhaps move these there?
-    // see also text.h
+// see also mongoutils/str.h - perhaps move these there?
+// see also text.h
 
-    void splitStringDelim( const string& str , vector<string>* res , char delim );
+void splitStringDelim(const std::string& str, std::vector<std::string>* res, char delim);
 
-    void joinStringDelim( const vector<string>& strs , string* res , char delim );
+void joinStringDelim(const std::vector<std::string>& strs, std::string* res, char delim);
 
-    inline string tolowerString( const string& input ) {
-        string::size_type sz = input.size();
+inline std::string tolowerString(StringData input) {
+    std::string::size_type sz = input.size();
 
-        boost::scoped_array<char> line(new char[sz+1]);
-        char * copy = line.get();
+    std::unique_ptr<char[]> line(new char[sz + 1]);
+    char* copy = line.get();
 
-        for ( string::size_type i=0; i<sz; i++ ) {
-            char c = input[i];
-            copy[i] = (char)tolower( (int)c );
-        }
-        copy[sz] = 0;
-        return string(copy);
+    for (std::string::size_type i = 0; i < sz; i++) {
+        char c = input[i];
+        copy[i] = (char)tolower((int)c);
     }
+    copy[sz] = 0;
+    return copy;
+}
 
+inline std::string toAsciiLowerCase(StringData input) {
+    size_t sz = input.size();
+    std::unique_ptr<char[]> line(new char[sz + 1]);
+    char* res = line.get();
+    for (size_t i = 0; i < sz; i++) {
+        char c = input[i];
+        if (c >= 'A' && c <= 'Z') {
+            res[i] = c + 32;
+        } else {
+            res[i] = c;
+        }
+    }
+    res[sz] = 0;
+    return res;
+}
+
+/** Functor for combining lexical and numeric comparisons. */
+class LexNumCmp {
+public:
+    /** @param lexOnly - compare all characters lexically, including digits. */
+    LexNumCmp(bool lexOnly);
     /**
      * Non numeric characters are compared lexicographically; numeric substrings
      * are compared numerically; dots separate ordered comparable subunits.
      * For convenience, character 255 is greater than anything else.
+     * @param lexOnly - compare all characters lexically, including digits.
      */
-    inline int lexNumCmp( const char *s1, const char *s2 ) {
-        //cout << "START : " << s1 << "\t" << s2 << endl;
+    static int cmp(StringData s1, StringData s2, bool lexOnly);
+    int cmp(StringData s1, StringData s2) const;
+    bool operator()(StringData s1, StringData s2) const;
 
-        bool startWord = true;
-        
-        while( *s1 && *s2 ) {
+private:
+    bool _lexOnly;
+};
 
-            bool d1 = ( *s1 == '.' );
-            bool d2 = ( *s2 == '.' );
-            if ( d1 && !d2 )
-             	return -1;
-            if ( d2 && !d1 )
-             	return 1;
-            if ( d1 && d2 ) {
-             	++s1; ++s2;
-                startWord = true;
-                continue;
-            }
-            
-            bool p1 = ( *s1 == (char)255 );
-            bool p2 = ( *s2 == (char)255 );
-            //cout << "\t\t " << p1 << "\t" << p2 << endl;
-            if ( p1 && !p2 )
-                return 1;
-            if ( p2 && !p1 )
-                return -1;
+// TODO: Sane-ify core std::string functionality
+// For now, this needs to be near the LexNumCmp or else
+int versionCmp(const StringData rhs, const StringData lhs);
 
-            bool n1 = isNumber( *s1 );
-            bool n2 = isNumber( *s2 );
+/**
+ * A method to escape whitespace and control characters in strings. For example, the string "\t"
+ * goes to "\\t". If `escape_slash` is true, then "/" goes to "\\/".
+ */
+std::string escape(StringData s, bool escape_slash = false);
 
-            if ( n1 && n2 ) {
-                // get rid of leading 0s
-                if ( startWord ) {
-                    while ( *s1 == '0' ) s1++;
-                    while ( *s2 == '0' ) s2++;
-                }
-
-                char * e1 = (char*)s1;
-                char * e2 = (char*)s2;
-
-                // find length
-                // if end of string, will break immediately ('\0')
-                while ( isNumber (*e1) ) e1++;
-                while ( isNumber (*e2) ) e2++;
-
-                int len1 = (int)(e1-s1);
-                int len2 = (int)(e2-s2);
-
-                int result;
-                // if one is longer than the other, return
-                if ( len1 > len2 ) {
-                    return 1;
-                }
-                else if ( len2 > len1 ) {
-                    return -1;
-                }
-                // if the lengths are equal, just strcmp
-                else if ( (result = strncmp(s1, s2, len1)) != 0 ) {
-                    return result;
-                }
-
-                // otherwise, the numbers are equal
-                s1 = e1;
-                s2 = e2;
-                startWord = false;
-                continue;
-            }
-            
-            if ( n1 )
-                return 1;
-
-            if ( n2 )
-                return -1;
-
-            if ( *s1 > *s2 )
-                return 1;
-
-            if ( *s2 > *s1 )
-                return -1;
-            
-            s1++; s2++;
-            startWord = false;
-        }
-
-        if ( *s1 )
-            return 1;
-        if ( *s2 )
-            return -1;
-        return 0;
-    }
-
-} // namespace mongo
+}  // namespace mongo

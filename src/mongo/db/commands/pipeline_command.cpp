@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2011 10gen Inc.
+ * Copyright (c) 2011-2014 MongoDB Inc.
  *
  * This program is free software: you can redistribute it and/or  modify
  * it under the terms of the GNU Affero General Public License, version 3,
@@ -12,151 +12,103 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * As a special exception, the copyright holders give permission to link the
+ * code of portions of this program with the OpenSSL library under certain
+ * conditions as described in each individual source file and distribute
+ * linked combinations including the program with the OpenSSL library. You
+ * must comply with the GNU Affero General Public License in all respects for
+ * all of the code used other than as permitted herein. If you modify file(s)
+ * with this exception, you may extend this exception to your version of the
+ * file(s), but you are not obligated to do so. If you do not wish to do so,
+ * delete this exception statement from your version. If you delete this
+ * exception statement from all source files in the program, then also delete
+ * it in the license file.
  */
 
-#include "pch.h"
+#include "mongo/platform/basic.h"
 
-#include "db/commands/pipeline.h"
-#include "db/commands/pipeline_d.h"
-#include "db/cursor.h"
-#include "db/pdfile.h"
-#include "db/pipeline/accumulator.h"
-#include "db/pipeline/document.h"
-#include "db/pipeline/document_source.h"
-#include "db/pipeline/expression.h"
-#include "db/pipeline/expression_context.h"
-#include "db/queryoptimizer.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/run_aggregate.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/pipeline.h"
 
 namespace mongo {
+namespace {
 
-    /** mongodb "commands" (sent via db.$cmd.findOne(...))
-        subclass to make a command.  define a singleton object for it.
-        */
-    class PipelineCommand :
-        public Command {
-    public:
-        // virtuals from Command
-        virtual ~PipelineCommand();
-        virtual bool run(const string &db, BSONObj &cmdObj, int options,
-                         string &errmsg, BSONObjBuilder &result, bool fromRepl);
-        virtual LockType locktype() const;
-        virtual bool slaveOk() const;
-        virtual void help(stringstream &help) const;
+bool isMergePipeline(const std::vector<BSONObj>& pipeline) {
+    if (pipeline.empty()) {
+        return false;
+    }
+    return pipeline[0].hasField("$mergeCursors");
+}
 
-        PipelineCommand();
-    };
+class PipelineCommand : public Command {
+public:
+    PipelineCommand() : Command("aggregate") {}
 
-    // self-registering singleton static instance
-    static PipelineCommand pipelineCommand;
-
-    PipelineCommand::PipelineCommand():
-        Command(Pipeline::commandName) {
+    void help(std::stringstream& help) const override {
+        help << "Runs the aggregation command. See http://dochub.mongodb.org/core/aggregation for "
+                "more details.";
     }
 
-    Command::LockType PipelineCommand::locktype() const {
-        return READ;
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return Pipeline::aggSupportsWriteConcern(cmd);
     }
 
-    bool PipelineCommand::slaveOk() const {
-        return true;
-    }
-
-    void PipelineCommand::help(stringstream &help) const {
-        help << "{ pipeline : [ { <data-pipe-op>: {...}}, ... ] }";
-    }
-
-    PipelineCommand::~PipelineCommand() {
-    }
-
-    bool PipelineCommand::run(const string &db, BSONObj &cmdObj,
-                              int options, string &errmsg,
-                              BSONObjBuilder &result, bool fromRepl) {
-
-        intrusive_ptr<ExpressionContext> pCtx(ExpressionContext::create());
-
-        /* try to parse the command; if this fails, then we didn't run */
-        intrusive_ptr<Pipeline> pPipeline(
-            Pipeline::parseCommand(errmsg, cmdObj, pCtx));
-        if (!pPipeline.get())
-            return false;
-
-        intrusive_ptr<DocumentSource> pSource(
-            PipelineD::prepareCursorSource(pPipeline, db));
-
-        /* this is the normal non-debug path */
-        if (!pPipeline->getSplitMongodPipeline())
-            return pPipeline->run(result, errmsg, pSource);
-
-        /* setup as if we're in the router */
-        pCtx->setInRouter(true);
-
-        /*
-          Here, we'll split the pipeline in the same way we would for sharding,
-          for testing purposes.
-
-          Run the shard pipeline first, then feed the results into the remains
-          of the existing pipeline.
-
-          Start by splitting the pipeline.
-         */
-        intrusive_ptr<Pipeline> pShardSplit(
-            pPipeline->splitForSharded());
-
-        /*
-          Write the split pipeline as we would in order to transmit it to
-          the shard servers.
-        */
-        BSONObjBuilder shardBuilder;
-        pShardSplit->toBson(&shardBuilder);
-        BSONObj shardBson(shardBuilder.done());
-
-        DEV (log() << "\n---- shardBson\n" <<
-             shardBson.jsonString(Strict, 1) << "\n----\n").flush();
-
-        /* for debugging purposes, show what the pipeline now looks like */
-        DEV {
-            BSONObjBuilder pipelineBuilder;
-            pPipeline->toBson(&pipelineBuilder);
-            BSONObj pipelineBson(pipelineBuilder.done());
-            (log() << "\n---- pipelineBson\n" <<
-             pipelineBson.jsonString(Strict, 1) << "\n----\n").flush();
-        }
-
-        /* on the shard servers, create the local pipeline */
-        intrusive_ptr<ExpressionContext> pShardCtx(ExpressionContext::create());
-        intrusive_ptr<Pipeline> pShardPipeline(
-            Pipeline::parseCommand(errmsg, shardBson, pShardCtx));
-        if (!pShardPipeline.get()) {
-            return false;
-        }
-
-        /* run the shard pipeline */
-        BSONObjBuilder shardResultBuilder;
-        string shardErrmsg;
-        pShardPipeline->run(shardResultBuilder, shardErrmsg, pSource);
-        BSONObj shardResult(shardResultBuilder.done());
-
-        /* pick out the shard result, and prepare to read it */
-        intrusive_ptr<DocumentSourceBsonArray> pShardSource;
-        BSONObjIterator shardIter(shardResult);
-        while(shardIter.more()) {
-            BSONElement shardElement(shardIter.next());
-            const char *pFieldName = shardElement.fieldName();
-
-            if (strcmp(pFieldName, "result") == 0) {
-                pShardSource = DocumentSourceBsonArray::create(&shardElement);
-
-                /*
-                  Connect the output of the shard pipeline with the mongos
-                  pipeline that will merge the results.
-                */
-                return pPipeline->run(result, errmsg, pShardSource);
-            }
-        }
-
-        /* NOTREACHED */
-        assert(false);
+    bool slaveOk() const override {
         return false;
     }
 
-} // namespace mongo
+    bool slaveOverrideOk() const override {
+        return true;
+    }
+
+    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const override {
+        return !AggregationRequest::parseNs(dbName, cmdObj).isCollectionlessAggregateNS();
+    }
+
+    ReadWriteType getReadWriteType() const {
+        return ReadWriteType::kRead;
+    }
+
+    Status checkAuthForCommand(Client* client,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) override {
+        const NamespaceString nss(AggregationRequest::parseNs(dbname, cmdObj));
+        return AuthorizationSession::get(client)->checkAuthForAggregate(nss, cmdObj, false);
+    }
+
+    bool run(OperationContext* opCtx,
+             const std::string& dbname,
+             const BSONObj& cmdObj,
+             std::string& errmsg,
+             BSONObjBuilder& result) override {
+        const auto aggregationRequest =
+            uassertStatusOK(AggregationRequest::parseFromBSON(dbname, cmdObj, boost::none));
+
+        return appendCommandStatus(result,
+                                   runAggregate(opCtx,
+                                                aggregationRequest.getNamespaceString(),
+                                                aggregationRequest,
+                                                cmdObj,
+                                                result));
+    }
+
+    Status explain(OperationContext* opCtx,
+                   const std::string& dbname,
+                   const BSONObj& cmdObj,
+                   ExplainOptions::Verbosity verbosity,
+                   BSONObjBuilder* out) const override {
+        const auto aggregationRequest =
+            uassertStatusOK(AggregationRequest::parseFromBSON(dbname, cmdObj, verbosity));
+
+        return runAggregate(
+            opCtx, aggregationRequest.getNamespaceString(), aggregationRequest, cmdObj, *out);
+    }
+
+} pipelineCmd;
+
+}  // namespace
+}  // namespace mongo

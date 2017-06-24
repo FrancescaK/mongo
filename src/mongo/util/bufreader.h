@@ -14,87 +14,123 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects
+*    for all of the code used other than as permitted herein. If you modify
+*    file(s) with this exception, you may extend this exception to your
+*    version of the file(s), but you are not obligated to do so. If you do not
+*    wish to do so, delete this exception statement from your version. If you
+*    delete this exception statement from all source files in the program,
+*    then also delete it in the license file.
 */
 
 #pragma once
 
+#include <utility>
+
+#include "mongo/base/data_range.h"
+#include "mongo/base/data_range_cursor.h"
+#include "mongo/base/data_type_terminated.h"
+#include "mongo/base/disallow_copying.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/platform/strnlen.h"
+#include "mongo/util/assert_util.h"
+
 namespace mongo {
 
-    /** helper to read and parse a block of memory
-        methods throw the eof exception if the operation would pass the end of the
-        buffer with which we are working.
-    */
-    class BufReader : boost::noncopyable {
-    public:
-        class eof : public std::exception {
-        public:
-            eof() { }
-            virtual const char * what() const throw() { return "BufReader eof"; }
-        };
+/** helper to read and parse a block of memory
+    methods throw the eof exception if the operation would pass the end of the
+    buffer with which we are working.
+*/
+class BufReader {
+    MONGO_DISALLOW_COPYING(BufReader);
 
-        BufReader(const void *p, unsigned len) : _start(p), _pos(p), _end(((char *)_pos)+len) { }
+public:
+    BufReader(const void* p, unsigned len)
+        : _start(reinterpret_cast<const char*>(p)), _pos(_start), _end(_start + len) {}
 
-        bool atEof() const { return _pos == _end; }
+    bool atEof() const {
+        return _pos == _end;
+    }
 
-        /** read in the object specified, and advance buffer pointer */
-        template <typename T>
-        void read(T &t) {
-            T* cur = (T*) _pos;
-            T *next = cur + 1;
-            if( _end < next ) throw eof();
-            t = *cur;
-            _pos = next;
-        }
+    /** read in the object specified, and advance buffer pointer */
+    template <typename T>
+    void read(T& t) {
+        ConstDataRangeCursor cdrc(_pos, _end);
+        uassertStatusOK(cdrc.readAndAdvance(&t));
+        _pos = cdrc.data();
+    }
 
-        /** verify we can look at t, but do not advance */
-        template <typename T>
-        void peek(T &t) {
-            T* cur = (T*) _pos;
-            T *next = cur + 1;
-            if( _end < next ) throw eof();
-            t = *cur;
-        }
+    /** read in and return an object of the specified type, and advance buffer pointer */
+    template <typename T>
+    T read() {
+        T out{};
+        read(out);
+        return out;
+    }
 
-        /** return current offset into buffer */
-        unsigned offset() const { return (char*)_pos - (char*)_start; }
+    /** read in the object specified, but do not advance buffer pointer */
+    template <typename T>
+    void peek(T& t) const {
+        uassertStatusOK(ConstDataRange(_pos, _end).read(&t));
+    }
 
-        /** return remaining bytes */
-        unsigned remaining() const { return (char*)_end -(char*)_pos; }
+    /** read in and return an object of the specified type, but do not advance buffer pointer */
+    template <typename T>
+    T peek() const {
+        T out{};
+        peek(out);
+        return out;
+    }
 
-        /** back up by nbytes */
-        void rewind(unsigned nbytes) {
-            _pos = ((char *) _pos) - nbytes;
-            assert( _pos >= _start );
-        }
+    /** return current offset into buffer */
+    unsigned offset() const {
+        return _pos - _start;
+    }
 
-        /** return current position pointer, and advance by len */
-        const void* skip(unsigned len) {
-            const char *nxt = ((char *) _pos) + len;
-            if( _end < nxt ) throw eof();
-            const void *p = _pos;
-            _pos = nxt;
-            return p;
-        }
+    /** return remaining bytes */
+    unsigned remaining() const {
+        return _end - _pos;
+    }
 
-        void readStr(string& s) {
-            StringBuilder b;
-            while( 1 ) {
-                char ch;
-                read(ch);
-                if( ch == 0 )
-                    break;
-                b << ch;
-            }
-            s = b.str();
-        }
+    /** back up by nbytes */
+    void rewind(unsigned nbytes) {
+        _pos = _pos - nbytes;
+        invariant(_pos >= _start);
+    }
 
-        const void* pos() { return _pos; }
-        const void* start() { return _start; }
+    /** return current position pointer, and advance by len */
+    const void* skip(unsigned len) {
+        ConstDataRangeCursor cdrc(_pos, _end);
+        uassertStatusOK(cdrc.advance(len));
+        return std::exchange(_pos, cdrc.data());
+    }
 
-    private:
-        const void *_start;
-        const void *_pos;
-        const void *_end;
-    };
+    /// reads a NUL terminated string
+    StringData readCStr() {
+        auto range = read<Terminated<'\0', ConstDataRange>>().value;
 
+        return StringData(range.data(), range.length());
+    }
+
+    void readStr(std::string& s) {
+        s = readCStr().toString();
+    }
+
+    const void* pos() {
+        return _pos;
+    }
+    const void* start() {
+        return _start;
+    }
+
+private:
+    const char* _start;
+    const char* _pos;
+    const char* _end;
+};
 }

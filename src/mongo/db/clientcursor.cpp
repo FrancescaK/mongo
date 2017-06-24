@@ -1,757 +1,312 @@
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*/
+ *    Copyright (C) 2008, 2013 10gen Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-/* clientcursor.cpp
+#include "mongo/platform/basic.h"
 
-   ClientCursor is a wrapper that represents a cursorid from our database
-   application's perspective.
+#include "mongo/db/clientcursor.h"
 
-   Cursor -- and its derived classes -- are our internal cursors.
-*/
-
-#include "pch.h"
-#include "clientcursor.h"
-#include "introspect.h"
+#include <string>
 #include <time.h>
-#include "db.h"
-#include "commands.h"
-#include "repl_block.h"
-#include "../util/processinfo.h"
-#include "../util/timer.h"
-#include "../server.h"
+#include <vector>
+
+#include "mongo/base/counter.h"
+#include "mongo/db/audit.h"
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/server_status.h"
+#include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/server_parameters.h"
+#include "mongo/util/background.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
+#include "mongo/util/exit.h"
 
 namespace mongo {
 
-    CCById ClientCursor::clientCursorsById;
-    boost::recursive_mutex& ClientCursor::ccmutex( *(new boost::recursive_mutex()) );
-    long long ClientCursor::numberTimedOut = 0;
+using std::string;
+using std::stringstream;
 
-    void aboutToDeleteForSharding( const Database* db , const DiskLoc& dl ); // from s/d_logic.h
+static Counter64 cursorStatsOpen;           // gauge
+static Counter64 cursorStatsOpenPinned;     // gauge
+static Counter64 cursorStatsOpenNoTimeout;  // gauge
+static Counter64 cursorStatsTimedOut;
 
-    /*static*/ void ClientCursor::assertNoCursors() {
-        recursive_scoped_lock lock(ccmutex);
-        if( clientCursorsById.size() ) {
-            log() << "ERROR clientcursors exist but should not at this point" << endl;
-            ClientCursor *cc = clientCursorsById.begin()->second;
-            log() << "first one: " << cc->_cursorid << ' ' << cc->_ns << endl;
-            clientCursorsById.clear();
-            assert(false);
-        }
+static ServerStatusMetricField<Counter64> dCursorStatsOpen("cursor.open.total", &cursorStatsOpen);
+static ServerStatusMetricField<Counter64> dCursorStatsOpenPinned("cursor.open.pinned",
+                                                                 &cursorStatsOpenPinned);
+static ServerStatusMetricField<Counter64> dCursorStatsOpenNoTimeout("cursor.open.noTimeout",
+                                                                    &cursorStatsOpenNoTimeout);
+static ServerStatusMetricField<Counter64> dCursorStatusTimedout("cursor.timedOut",
+                                                                &cursorStatsTimedOut);
+
+MONGO_EXPORT_SERVER_PARAMETER(clientCursorMonitorFrequencySecs, int, 4);
+
+long long ClientCursor::totalOpen() {
+    return cursorStatsOpen.get();
+}
+
+ClientCursor::ClientCursor(ClientCursorParams params,
+                           CursorManager* cursorManager,
+                           CursorId cursorId,
+                           boost::optional<LogicalSessionId> lsid,
+                           Date_t now)
+    : _cursorid(cursorId),
+      _nss(std::move(params.nss)),
+      _authenticatedUsers(std::move(params.authenticatedUsers)),
+      _lsid(std::move(lsid)),
+      _isReadCommitted(params.isReadCommitted),
+      _cursorManager(cursorManager),
+      _originatingCommand(params.originatingCommandObj),
+      _queryOptions(params.queryOptions),
+      _exec(std::move(params.exec)),
+      _lastUseDate(now) {
+    invariant(_cursorManager);
+    invariant(_exec);
+
+    cursorStatsOpen.increment();
+
+    if (isNoTimeout()) {
+        // cursors normally timeout after an inactivity period to prevent excess memory use
+        // setting this prevents timeout of the cursor in question.
+        cursorStatsOpenNoTimeout.increment();
+    }
+}
+
+ClientCursor::~ClientCursor() {
+    // Cursors must be unpinned and deregistered from their cursor manager before being deleted.
+    invariant(!_isPinned);
+    invariant(_disposed);
+
+    cursorStatsOpen.decrement();
+    if (isNoTimeout()) {
+        cursorStatsOpenNoTimeout.decrement();
+    }
+}
+
+void ClientCursor::markAsKilled(const std::string& reason) {
+    _exec->markAsKilled(reason);
+}
+
+void ClientCursor::dispose(OperationContext* opCtx) {
+    if (_disposed) {
+        return;
     }
 
+    _exec->dispose(opCtx, _cursorManager);
+    _disposed = true;
+}
 
-    void ClientCursor::setLastLoc_inlock(DiskLoc L) {
-        assert( _pos != -2 ); // defensive - see ~ClientCursor
+void ClientCursor::updateSlaveLocation(OperationContext* opCtx) {
+    if (_slaveReadTill.isNull())
+        return;
 
-        if ( L == _lastLoc )
-            return;
+    verify(_nss.isOplog());
 
-        CCByLoc& bl = byLoc();
+    Client* c = opCtx->getClient();
+    verify(c);
+    OID rid = repl::ReplClientInfo::forClient(c).getRemoteID();
+    if (!rid.isSet())
+        return;
 
-        if ( !_lastLoc.isNull() ) {
-            bl.erase( ByLocKey( _lastLoc, _cursorid ) );
-        }
+    repl::getGlobalReplicationCoordinator()
+        ->setLastOptimeForSlave(rid, _slaveReadTill)
+        .transitional_ignore();
+}
 
-        if ( !L.isNull() )
-            bl[ByLocKey(L,_cursorid)] = this;
-        _lastLoc = L;
+//
+// Pin methods
+//
+
+ClientCursorPin::ClientCursorPin(OperationContext* opCtx, ClientCursor* cursor)
+    : _opCtx(opCtx), _cursor(cursor) {
+    invariant(_cursor);
+    invariant(_cursor->_isPinned);
+    invariant(_cursor->_cursorManager);
+    invariant(!_cursor->_disposed);
+
+    // We keep track of the number of cursors currently pinned. The cursor can become unpinned
+    // either by being released back to the cursor manager or by being deleted. A cursor may be
+    // transferred to another pin object via move construction or move assignment, but in this case
+    // it is still considered pinned.
+    cursorStatsOpenPinned.increment();
+}
+
+ClientCursorPin::ClientCursorPin(ClientCursorPin&& other)
+    : _opCtx(other._opCtx), _cursor(other._cursor) {
+    // The pinned cursor is being transferred to us from another pin. The 'other' pin must have a
+    // pinned cursor.
+    invariant(other._cursor);
+    invariant(other._cursor->_isPinned);
+
+    // Be sure to set the 'other' pin's cursor to null in order to transfer ownership to ourself.
+    other._cursor = nullptr;
+    other._opCtx = nullptr;
+}
+
+ClientCursorPin& ClientCursorPin::operator=(ClientCursorPin&& other) {
+    if (this == &other) {
+        return *this;
     }
 
-    /* ------------------------------------------- */
+    // The pinned cursor is being transferred to us from another pin. The 'other' pin must have a
+    // pinned cursor, and we must not have a cursor.
+    invariant(!_cursor);
+    invariant(other._cursor);
+    invariant(other._cursor->_isPinned);
 
-    /* must call this when a btree node is updated */
-    //void removedKey(const DiskLoc& btreeLoc, int keyPos) {
-    //}
+    // Copy the cursor pointer to ourselves, but also be sure to set the 'other' pin's cursor to
+    // null so that it no longer has the cursor pinned.
+    // Be sure to set the 'other' pin's cursor to null in order to transfer ownership to ourself.
+    _cursor = other._cursor;
+    other._cursor = nullptr;
 
-    // ns is either a full namespace or "dbname." when invalidating for a whole db
-    void ClientCursor::invalidate(const char *ns) {
-        d.dbMutex.assertWriteLocked();
-        int len = strlen(ns);
-        const char* dot = strchr(ns, '.');
-        assert( len > 0 && dot);
+    _opCtx = other._opCtx;
+    other._opCtx = nullptr;
 
-        bool isDB = (dot == &ns[len-1]); // first (and only) dot is the last char
+    return *this;
+}
 
-        {
-            //cout << "\nTEMP invalidate " << ns << endl;
-            Database *db = cc().database();
-            assert(db);
-            assert( str::startsWith(ns, db->name) );
+ClientCursorPin::~ClientCursorPin() {
+    release();
+}
 
-            for( LockedIterator i; i.ok(); ) {
-                ClientCursor *cc = i.current();
+void ClientCursorPin::release() {
+    if (!_cursor)
+        return;
 
-                bool shouldDelete = false;
-                if ( cc->_db == db ) {
-                    if (isDB) {
-                        // already checked that db matched above
-                        dassert( str::startsWith(cc->_ns.c_str(), ns) );
-                        shouldDelete = true;
-                    }
-                    else {
-                        if ( str::equals(cc->_ns.c_str(), ns) )
-                            shouldDelete = true;
-                    }
-                }
-                
-                if ( shouldDelete ) {
-                    i.deleteAndAdvance();
-                }
-                else {
-                    i.advance();
-                }
-            }
+    // Note it's not safe to dereference _cursor->_cursorManager unless we know we haven't been
+    // killed. If we're not locked we assume we haven't been killed because we're working with the
+    // global cursor manager which never kills cursors.
+    const bool isLocked =
+        _opCtx->lockState()->isCollectionLockedForMode(_cursor->_nss.ns(), MODE_IS);
+    dassert(isLocked || _cursor->_cursorManager->isGlobalManager());
 
-            /*
-            note : we can't iterate byloc because clientcursors may exist with a loc of null in which case
-                   they are not in the map.  perhaps they should not exist though in the future?  something to
-                   change???
+    invariant(_cursor->_isPinned);
 
-            CCByLoc& bl = db->ccByLoc;
-            for ( CCByLoc::iterator i = bl.begin(); i != bl.end(); ++i ) {
-                ClientCursor *cc = i->second;
-                if ( strncmp(ns, cc->ns.c_str(), len) == 0 ) {
-                    assert( cc->_db == db );
-                    toDelete.push_back(i->second);
-                }
-            }*/
-
-            /*cout << "TEMP after invalidate " << endl;
-            for( auto i = clientCursorsById.begin(); i != clientCursorsById.end(); ++i ) {
-                cout << "  " << i->second->ns << endl;
-            }
-            cout << "TEMP after invalidate done" << endl;*/
-        }
+    if (_cursor->getExecutor()->isMarkedAsKilled()) {
+        // The ClientCursor was killed while we had it.  Therefore, it is our responsibility to
+        // call dispose() and delete it.
+        deleteUnderlying();
+    } else {
+        // Unpin the cursor under the collection cursor manager lock.
+        _cursor->_cursorManager->unpin(_opCtx, _cursor);
+        cursorStatsOpenPinned.decrement();
     }
 
-    /* note called outside of locks (other than ccmutex) so care must be exercised */
-    bool ClientCursor::shouldTimeout( unsigned millis ) {
-        _idleAgeMillis += millis;
-        return _idleAgeMillis > 600000 && _pinValue == 0;
+    _cursor = nullptr;
+}
+
+void ClientCursorPin::deleteUnderlying() {
+    invariant(_cursor);
+    invariant(_cursor->_isPinned);
+    // Note the following subtleties of this method's implementation:
+    // - We must unpin the cursor before destruction, since it is an error to delete a pinned
+    //   cursor.
+    // - In addition, we must deregister the cursor before unpinning, since it is an
+    //   error to unpin a registered cursor without holding the cursor manager lock (note that
+    //   we can't simply unpin with the cursor manager lock here, since we need to guarantee
+    //   exclusive ownership of the cursor when we are deleting it).
+
+    // Note it's not safe to dereference _cursor->_cursorManager unless we know we haven't been
+    // killed. If we're not locked we assume we haven't been killed because we're working with the
+    // global cursor manager which never kills cursors.
+    const bool isLocked =
+        _opCtx->lockState()->isCollectionLockedForMode(_cursor->_nss.ns(), MODE_IS);
+    dassert(isLocked || _cursor->_cursorManager->isGlobalManager());
+
+    if (!_cursor->getExecutor()->isMarkedAsKilled()) {
+        _cursor->_cursorManager->deregisterCursor(_cursor);
     }
 
-    /* called every 4 seconds.  millis is amount of idle time passed since the last call -- could be zero */
-    void ClientCursor::idleTimeReport(unsigned millis) {
-        bool foundSomeToTimeout = false;
+    // Make sure the cursor is disposed and unpinned before being destroyed.
+    _cursor->dispose(_opCtx);
+    _cursor->_isPinned = false;
+    delete _cursor;
 
-        // two passes so that we don't need to readlock unless we really do some timeouts
-        // we assume here that incrementing _idleAgeMillis outside readlock is ok.
-        {
-            recursive_scoped_lock lock(ccmutex);
-            {
-                unsigned sz = clientCursorsById.size();
-                static time_t last;
-                if( sz >= 100000 ) { 
-                    if( time(0) - last > 300 ) {
-                        last = time(0);
-                        log() << "warning number of open cursors is very large: " << sz << endl;
-                    }
-                }
-            }
-            for ( CCById::iterator i = clientCursorsById.begin(); i != clientCursorsById.end();  ) {
-                CCById::iterator j = i;
-                i++;
-                if( j->second->shouldTimeout( millis ) ) {
-                    foundSomeToTimeout = true;
-                }
-            }
-        }
+    cursorStatsOpenPinned.decrement();
+    _cursor = nullptr;
+}
 
-        if( foundSomeToTimeout ) {
-            // todo: ideally all readlocks automatically note what we are locking for so this 
-            // can be reported in currentop command. e.g. something like:
-            //   readlock lk("", "timeout cursors");
-            readlock lk("");
-            for( LockedIterator i; i.ok(); ) {
-                ClientCursor *cc = i.current();
-                if( cc->shouldTimeout(0) ) {
-                    numberTimedOut++;
-                    LOG(1) << "killing old cursor " << cc->_cursorid << ' ' << cc->_ns
-                           << " idle:" << cc->idleTime() << "ms\n";
-                    i.deleteAndAdvance();
-                }
-                else {
-                    i.advance();
-                }
-            }
-        }
+ClientCursor* ClientCursorPin::getCursor() const {
+    return _cursor;
+}
+
+namespace {
+//
+// ClientCursorMonitor
+//
+
+/**
+ * Thread for timing out inactive cursors.
+ */
+class ClientCursorMonitor : public BackgroundJob {
+public:
+    std::string name() const {
+        return "ClientCursorMonitor";
     }
 
-    /* must call when a btree bucket going away.
-       note this is potentially slow
-    */
-    void ClientCursor::informAboutToDeleteBucket(const DiskLoc& b) {
-        recursive_scoped_lock lock(ccmutex);
-        Database *db = cc().database();
-        CCByLoc& bl = db->ccByLoc;
-        RARELY if ( bl.size() > 70 ) {
-            log() << "perf warning: byLoc.size=" << bl.size() << " in aboutToDeleteBucket\n";
-        }
-        if( bl.size() == 0 ) { 
-            DEV tlog() << "debug warning: no cursors found in informAboutToDeleteBucket()" << endl;
-        }
-        for ( CCByLoc::iterator i = bl.begin(); i != bl.end(); i++ )
-            i->second->_c->aboutToDeleteBucket(b);
-    }
-    void aboutToDeleteBucket(const DiskLoc& b) {
-        ClientCursor::informAboutToDeleteBucket(b);
-    }
-
-    /* must call this on a delete so we clean up the cursors. */
-    void ClientCursor::aboutToDelete(const DiskLoc& dl) {
-        recursive_scoped_lock lock(ccmutex);
-
-        Database *db = cc().database();
-        assert(db);
-
-        aboutToDeleteForSharding( db , dl );
-
-        CCByLoc& bl = db->ccByLoc;
-        CCByLoc::iterator j = bl.lower_bound(ByLocKey::min(dl));
-        CCByLoc::iterator stop = bl.upper_bound(ByLocKey::max(dl));
-        if ( j == stop )
-            return;
-
-        vector<ClientCursor*> toAdvance;
-
-        while ( 1 ) {
-            toAdvance.push_back(j->second);
-            DEV assert( j->first.loc == dl );
-            ++j;
-            if ( j == stop )
-                break;
-        }
-
-        if( toAdvance.size() >= 3000 ) {
-            log() << "perf warning MPW101: " << toAdvance.size() << " cursors for one diskloc "
-                  << dl.toString()
-                  << ' ' << toAdvance[1000]->_ns
-                  << ' ' << toAdvance[2000]->_ns
-                  << ' ' << toAdvance[1000]->_pinValue
-                  << ' ' << toAdvance[2000]->_pinValue
-                  << ' ' << toAdvance[1000]->_pos
-                  << ' ' << toAdvance[2000]->_pos
-                  << ' ' << toAdvance[1000]->_idleAgeMillis
-                  << ' ' << toAdvance[2000]->_idleAgeMillis
-                  << ' ' << toAdvance[1000]->_doingDeletes
-                  << ' ' << toAdvance[2000]->_doingDeletes
-                  << endl;
-            //wassert( toAdvance.size() < 5000 );
-        }
-
-        for ( vector<ClientCursor*>::iterator i = toAdvance.begin(); i != toAdvance.end(); ++i ) {
-            ClientCursor* cc = *i;
-            wassert(cc->_db == db);
-
-            if ( cc->_doingDeletes ) continue;
-
-            Cursor *c = cc->_c.get();
-            if ( c->capped() ) {
-                /* note we cannot advance here. if this condition occurs, writes to the oplog
-                   have "caught" the reader.  skipping ahead, the reader would miss postentially
-                   important data.
-                   */
-                delete cc;
-                continue;
-            }
-
-            c->checkLocation();
-            DiskLoc tmp1 = c->refLoc();
-            if ( tmp1 != dl ) {
-                // This might indicate a failure to call ClientCursor::updateLocation() but it can
-                // also happen during correct operation, see SERVER-2009.
-                problem() << "warning: cursor loc " << tmp1 << " does not match byLoc position " << dl << " !" << endl;
-            }
-            else {
-                c->advance();
-            }
-            while (!c->eof() && c->refLoc() == dl) {
-                /* We don't delete at EOF because we want to return "no more results" rather than "no such cursor".
-                 * The loop is to handle MultiKey indexes where the deleted record is pointed to by multiple adjacent keys.
-                 * In that case we need to advance until we get to the next distinct record or EOF.
-                 * SERVER-4154
-                 */
-                c->advance();
-            }
-            cc->updateLocation();
-        }
-    }
-    void aboutToDelete(const DiskLoc& dl) { ClientCursor::aboutToDelete(dl); }
-
-    void ClientCursor::LockedIterator::deleteAndAdvance() {
-        ClientCursor *cc = current();
-        CursorId id = cc->cursorid();
-        delete cc;
-        _i = clientCursorsById.upper_bound( id );
-    }
-    
-    ClientCursor::ClientCursor(int queryOptions, const shared_ptr<Cursor>& c, const string& ns, BSONObj query ) :
-        _ns(ns), _db( cc().database() ),
-        _c(c), _pos(0),
-        _query(query),  _queryOptions(queryOptions),
-        _idleAgeMillis(0), _pinValue(0),
-        _doingDeletes(false), _yieldSometimesTracker(128,10) {
-
-        d.dbMutex.assertAtLeastReadLocked();
-
-        assert( _db );
-        assert( str::startsWith(_ns, _db->name) );
-        if( queryOptions & QueryOption_NoCursorTimeout )
-            noTimeout();
-        recursive_scoped_lock lock(ccmutex);
-        _cursorid = allocCursorId_inlock();
-        clientCursorsById.insert( make_pair(_cursorid, this) );
-
-        if ( ! _c->modifiedKeys() ) {
-            // store index information so we can decide if we can
-            // get something out of the index key rather than full object
-
-            int x = 0;
-            BSONObjIterator i( _c->indexKeyPattern() );
-            while ( i.more() ) {
-                BSONElement e = i.next();
-                if ( e.isNumber() ) {
-                    // only want basic index fields, not "2d" etc
-                    _indexedFields[e.fieldName()] = x;
-                }
-                x++;
-            }
-        }
-
-    }
-
-
-    ClientCursor::~ClientCursor() {
-        if( _pos == -2 ) {
-            // defensive: destructor called twice
-            wassert(false);
-            return;
-        }
-
-        {
-            recursive_scoped_lock lock(ccmutex);
-            setLastLoc_inlock( DiskLoc() ); // removes us from bylocation multimap
-            clientCursorsById.erase(_cursorid);
-
-            // defensive:
-            (CursorId&)_cursorid = -1;
-            _pos = -2;
-        }
-    }
-
-    bool ClientCursor::getFieldsDotted( const string& name, BSONElementSet &ret, BSONObj& holder ) {
-
-        map<string,int>::const_iterator i = _indexedFields.find( name );
-        if ( i == _indexedFields.end() ) {
-            current().getFieldsDotted( name , ret );
-            return false;
-        }
-
-        int x = i->second;
-
-        holder = currKey();
-        BSONObjIterator it( holder );
-        while ( x && it.more() ) {
-            it.next();
-            x--;
-        }
-        assert( x == 0 );
-        ret.insert( it.next() );
-        return true;
-    }
-
-    BSONElement ClientCursor::getFieldDotted( const string& name , BSONObj& holder , bool * fromKey ) {
-
-        map<string,int>::const_iterator i = _indexedFields.find( name );
-        if ( i == _indexedFields.end() ) {
-            if ( fromKey )
-                *fromKey = false;
-            holder = current();
-            return holder.getFieldDotted( name );
-        }
-        
-        int x = i->second;
-
-        holder = currKey();
-        BSONObjIterator it( holder );
-        while ( x && it.more() ) {
-            it.next();
-            x--;
-        }
-        assert( x == 0 );
-
-        if ( fromKey )
-            *fromKey = true;
-        return it.next();
-    }
-
-    BSONObj ClientCursor::extractFields(const BSONObj &pattern , bool fillWithNull ) {
-        BSONObjBuilder b( pattern.objsize() * 2 );
-
-        BSONObj holder;
-     
-        BSONObjIterator i( pattern ); 
-        while ( i.more() ) {
-            BSONElement key = i.next();
-            BSONElement value = getFieldDotted( key.fieldName() , holder );
-
-            if ( value.type() ) {
-                b.appendAs( value , key.fieldName() );
-                continue;
-            }
-
-            if ( fillWithNull ) 
-                b.appendNull( key.fieldName() );            
-            
-        }
-
-        return b.obj();
-    }
-    
-
-    /* call when cursor's location changes so that we can update the
-       cursorsbylocation map.  if you are locked and internally iterating, only
-       need to call when you are ready to "unlock".
-    */
-    void ClientCursor::updateLocation() {
-        assert( _cursorid );
-        _idleAgeMillis = 0;
-        DiskLoc cl = _c->refLoc();
-        if ( lastLoc() == cl ) {
-            //log() << "info: lastloc==curloc " << ns << '\n';
-        }
-        else {
-            recursive_scoped_lock lock(ccmutex);
-            setLastLoc_inlock(cl);
-        }
-        // may be necessary for MultiCursor even when cl hasn't changed
-        _c->noteLocation();
-    }
-
-    int ClientCursor::suggestYieldMicros() {
-        int writers = 0;
-        int readers = 0;
-
-        int micros = Client::recommendedYieldMicros( &writers , &readers );
-
-        if ( micros > 0 && writers == 0 && d.dbMutex.getState() <= 0 ) {
-            // we have a read lock, and only reads are coming on, so why bother unlocking
-            return 0;
-        }
-
-        wassert( micros < 10000000 );
-        dassert( micros <  1000001 );
-        return micros;
-    }
-    
-    Record* ClientCursor::_recordForYield( ClientCursor::RecordNeeds need ) {
-        if ( need == DontNeed ) {
-            return 0;
-        }
-        else if ( need == MaybeCovered ) {
-            // TODO
-            return 0;
-        }
-        else if ( need == WillNeed ) {
-            // no-op
-        }
-        else {
-            warning() << "don't understand RecordNeeds: " << (int)need << endl;
-            return 0;
-        }
-
-        DiskLoc l = currLoc();
-        if ( l.isNull() )
-            return 0;
-        
-        Record * rec = l.rec();
-        if ( rec->likelyInPhysicalMemory() ) 
-            return 0;
-        
-        return rec;
-    }
-
-    bool ClientCursor::yieldSometimes( RecordNeeds need, bool *yielded ) {
-        if ( yielded ) {
-            *yielded = false;   
-        }
-        if ( ! _yieldSometimesTracker.intervalHasElapsed() ) {
-            Record* rec = _recordForYield( need );
-            if ( rec ) {
-                // yield for page fault
-                if ( yielded ) {
-                    *yielded = true;   
-                }
-                return yield( suggestYieldMicros() , rec );
-            }
-            return true;
-        }
-
-        int micros = suggestYieldMicros();
-        if ( micros > 0 ) {
-            if ( yielded ) {
-                *yielded = true;   
-            }
-            return yield( micros , _recordForYield( need ) );
-        }
-        return true;
-    }
-
-    void ClientCursor::staticYield( int micros , const StringData& ns , Record * rec ) {
-        killCurrentOp.checkForInterrupt( false );
-        {
-            auto_ptr<LockMongoFilesShared> lk;
-            if ( rec ) {
-                // need to lock this else rec->touch won't be safe file could disappear
-                lk.reset( new LockMongoFilesShared() );
-            }
-            
-            dbtempreleasecond unlock;
-            if ( unlock.unlocked() ) {
-                if ( micros == -1 )
-                    micros = Client::recommendedYieldMicros();
-                if ( micros > 0 )
-                    sleepmicros( micros );
-            }
-            else {
-                CurOp * c = cc().curop();
-                while ( c->parent() )
-                    c = c->parent();
-                LOGSOME << "warning ClientCursor::yield can't unlock b/c of recursive lock"
-                          << " ns: " << ns 
-                          << " top: " << c->info()
-                          << endl;
-            }
-
-            if ( rec )
-                rec->touch();
-
-            lk.reset(0); // need to release this before dbtempreleasecond
-        }
-    }
-
-    bool ClientCursor::prepareToYield( YieldData &data ) {
-        if ( ! _c->supportYields() )
-            return false;
-        if ( ! _c->prepareToYield() ) {
-            return false;   
-        }
-        // need to store in case 'this' gets deleted
-        data._id = _cursorid;
-
-        data._doingDeletes = _doingDeletes;
-        _doingDeletes = false;
-
-        updateLocation();
-
-        {
-            /* a quick test that our temprelease is safe.
-             todo: make a YieldingCursor class
-             and then make the following code part of a unit test.
-             */
-            const int test = 0;
-            static bool inEmpty = false;
-            if( test && !inEmpty ) {
-                inEmpty = true;
-                log() << "TEST: manipulate collection during cc:yield" << endl;
-                if( test == 1 )
-                    Helpers::emptyCollection(_ns.c_str());
-                else if( test == 2 ) {
-                    BSONObjBuilder b; string m;
-                    dropCollection(_ns.c_str(), m, b);
-                }
-                else {
-                    dropDatabase(_ns.c_str());
-                }
-            }
-        }
-        return true;
-    }
-
-    bool ClientCursor::recoverFromYield( const YieldData &data ) {
-        ClientCursor *cc = ClientCursor::find( data._id , false );
-        if ( cc == 0 ) {
-            // id was deleted
-            return false;
-        }
-
-        cc->_doingDeletes = data._doingDeletes;
-        cc->_c->recoverFromYield();
-        return true;
-    }
-
-    /** @return true if cursor is still ok */
-    bool ClientCursor::yield( int micros , Record * recordToLoad ) {
-
-        if ( ! _c->supportYields() ) // so me cursors (geo@oct2011) don't support yielding
-            return true;
-
-        YieldData data;
-        prepareToYield( data );
-        staticYield( micros , _ns , recordToLoad );
-        return ClientCursor::recoverFromYield( data );
-    }
-
-    long long ctmLast = 0; // so we don't have to do find() which is a little slow very often.
-    long long ClientCursor::allocCursorId_inlock() {
-        long long ctm = curTimeMillis64();
-        dassert( ctm );
-        long long x;
-        while ( 1 ) {
-            x = (((long long)rand()) << 32);
-            x = x ^ ctm;
-            if ( ctm != ctmLast || ClientCursor::find_inlock(x, false) == 0 )
-                break;
-        }
-        ctmLast = ctm;
-        return x;
-    }
-
-    void ClientCursor::storeOpForSlave( DiskLoc last ) {
-        if ( ! ( _queryOptions & QueryOption_OplogReplay ))
-            return;
-
-        if ( last.isNull() )
-            return;
-
-        BSONElement e = last.obj()["ts"];
-        if ( e.type() == Date || e.type() == Timestamp )
-            _slaveReadTill = e._opTime();
-    }
-
-    void ClientCursor::updateSlaveLocation( CurOp& curop ) {
-        if ( _slaveReadTill.isNull() )
-            return;
-        mongo::updateSlaveLocation( curop , _ns.c_str() , _slaveReadTill );
-    }
-
-
-    void ClientCursor::appendStats( BSONObjBuilder& result ) {
-        recursive_scoped_lock lock(ccmutex);
-        result.appendNumber("totalOpen", clientCursorsById.size() );
-        result.appendNumber("clientCursors_size", (int) numCursors());
-        result.appendNumber("timedOut" , numberTimedOut);
-        unsigned pinned = 0;
-        unsigned notimeout = 0;
-        for ( CCById::iterator i = clientCursorsById.begin(); i != clientCursorsById.end(); i++ ) {
-            unsigned p = i->second->_pinValue;
-            if( p >= 100 )
-                pinned++;
-            else if( p > 0 )
-                notimeout++;
-        }
-        if( pinned ) 
-            result.append("pinned", pinned);
-        if( notimeout )
-            result.append("totalNoTimeout", notimeout);
-    }
-
-    // QUESTION: Restrict to the namespace from which this command was issued?
-    // Alternatively, make this command admin-only?
-    class CmdCursorInfo : public Command {
-    public:
-        CmdCursorInfo() : Command( "cursorInfo", true ) {}
-        virtual bool slaveOk() const { return true; }
-        virtual void help( stringstream& help ) const {
-            help << " example: { cursorInfo : 1 }";
-        }
-        virtual LockType locktype() const { return NONE; }
-        bool run(const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
-            ClientCursor::appendStats( result );
-            return true;
-        }
-    } cmdCursorInfo;
-
-    struct Mem { 
-        Mem() { res = virt = mapped = 0; }
-        int res;
-        int virt;
-        int mapped;
-        bool grew(const Mem& r) { 
-            return (r.res && (((double)res)/r.res)>1.1 ) ||
-              (r.virt && (((double)virt)/r.virt)>1.1 ) ||
-              (r.mapped && (((double)mapped)/r.mapped)>1.1 );
-        }
-    };
-
-    /** called once a minute from killcursors thread */
-    void sayMemoryStatus() { 
-        static time_t last;
-        static Mem mlast;
-        try {
-            ProcessInfo p;
-            if ( !cmdLine.quiet && p.supported() ) {
-                Mem m;
-                m.res = p.getResidentSize();
-                m.virt = p.getVirtualMemorySize();
-                m.mapped = (int) (MemoryMappedFile::totalMappedLength() / ( 1024 * 1024 ));
-                if( time(0)-last >= 300 || m.grew(mlast) ) { 
-                    log() << "mem (MB) res:" << m.res << " virt:" << m.virt << " mapped:" << m.mapped << endl;
-                    if( m.virt - (cmdLine.dur?2:1)*m.mapped > 5000 ) { 
-                        ONCE log() << "warning virtual/mapped memory differential is large. journaling:" << cmdLine.dur << endl;
-                    }
-                    last = time(0);
-                    mlast = m;
-                }
-            }
-        }
-        catch(...) {
-            log() << "ProcessInfo exception" << endl;
-        }
-    }
-
-    /** thread for timing out old cursors */
-    void ClientCursorMonitor::run() {
+    void run() {
         Client::initThread("clientcursormon");
-        Client& client = cc();
-        Timer t;
-        const int Secs = 4;
-        unsigned n = 0;
-        while ( ! inShutdown() ) {
-            ClientCursor::idleTimeReport( t.millisReset() );
-            sleepsecs(Secs);
-            if( ++n % (60/4) == 0 /*once a minute*/ ) { 
-                sayMemoryStatus();
+        while (!globalInShutdownDeprecated()) {
+            {
+                const ServiceContext::UniqueOperationContext opCtx = cc().makeOperationContext();
+                auto now = opCtx->getServiceContext()->getPreciseClockSource()->now();
+                cursorStatsTimedOut.increment(
+                    CursorManager::timeoutCursorsGlobal(opCtx.get(), now));
             }
-        }
-        client.shutdown();
-    }
-
-    void ClientCursor::find( const string& ns , set<CursorId>& all ) {
-        recursive_scoped_lock lock(ccmutex);
-
-        for ( CCById::iterator i=clientCursorsById.begin(); i!=clientCursorsById.end(); ++i ) {
-            if ( i->second->_ns == ns )
-                all.insert( i->first );
+            MONGO_IDLE_THREAD_BLOCK;
+            sleepsecs(clientCursorMonitorFrequencySecs.load());
         }
     }
+};
 
-    int ClientCursor::erase(int n, long long *ids) {
-        int found = 0;
-        for ( int i = 0; i < n; i++ ) {
-            if ( erase(ids[i]) )
-                found++;
+// Only one instance of the ClientCursorMonitor exists
+ClientCursorMonitor clientCursorMonitor;
 
-            if ( inShutdown() )
-                break;
-        }
-        return found;
+void _appendCursorStats(BSONObjBuilder& b) {
+    b.append("note", "deprecated, use server status metrics");
+    b.appendNumber("clientCursors_size", cursorStatsOpen.get());
+    b.appendNumber("totalOpen", cursorStatsOpen.get());
+    b.appendNumber("pinned", cursorStatsOpenPinned.get());
+    b.appendNumber("totalNoTimeout", cursorStatsOpenNoTimeout.get());
+    b.appendNumber("timedOut", cursorStatsTimedOut.get());
+}
+}
 
-    }
+void startClientCursorMonitor() {
+    clientCursorMonitor.go();
+}
 
-    ClientCursorMonitor clientCursorMonitor;
-
-} // namespace mongo
+}  // namespace mongo

@@ -1,16 +1,32 @@
 #!/usr/bin/env python
 
+"""Produces a report of all assertions in the MongoDB server codebase.
+
+Parses .cpp files for assertions and verifies assertion codes are distinct.
+Optionally replaces zero codes in source code with new distinct values.
+"""
+
+import bisect
 import os
-import sys
 import re
+import sys
 import utils
+from collections import defaultdict, namedtuple
+from optparse import OptionParser
+
+ASSERT_NAMES = [ "uassert" , "massert", "fassert", "fassertFailed" ]
+MINIMUM_CODE = 10000
+
+codes = []
+
+# Each AssertLocation identifies the C++ source location of an assertion
+AssertLocation = namedtuple( "AssertLocation", ['sourceFile', 'lineNum', 'lines', 'code'] )
 
 
-assertNames = [ "uassert" , "massert" ]
-
+# Of historical interest only
 def assignErrorCodes():
-    cur = 10000
-    for root in assertNames:
+    cur = MINIMUM_CODE
+    for root in ASSERT_NAMES:
         for x in utils.getAllSourceFiles():
             print( x )
             didAnything = False
@@ -29,141 +45,224 @@ def assignErrorCodes():
                 out.close()
 
 
-codes = []
+def parseSourceFiles( callback ):
+    """Walks MongoDB sourcefiles and invokes callback for each AssertLocation found."""
 
-def readErrorCodes( callback, replaceZero = False ):
-    
-    quick = [ "assert" , "Exception" , "verify" ]
+    quick = [ "assert" , "Exception"]
 
-    ps = [ re.compile( "(([umsg]asser(t|ted))) *\(( *)(\d+)" ) ,
-           re.compile( "((User|Msg|MsgAssertion)Exceptio(n))\(( *)(\d+)" ) ,
-           re.compile( "(((verify))) *\(( *)(\d+)" )
-           ]
-    
-    for x in utils.getAllSourceFiles():
-        
-        needReplace = [False]
-        lines = []
-        lastCodes = [0]
-        lineNum = 1
-        
-        for line in open( x ):
+    patterns = [
+        re.compile( r"(?:u|m(?:sg)?)asser(?:t|ted)(?:NoTrace)?\s*\(\s*(\d+)", re.MULTILINE ) ,
+        re.compile( r"(?:User|Msg|MsgAssertion)Exception\s*\(\s*(\d+)", re.MULTILINE ),
+        re.compile( r"fassert(?:Failed)?(?:WithStatus)?(?:NoTrace)?(?:StatusOK)?\s*\(\s*(\d+)",
+                    re.MULTILINE ),
+    ]
 
-            found = False
-            for zz in quick:
-                if line.find( zz ) >= 0:
-                    found = True
-                    break
+    bad = [ re.compile( r"^\s*assert *\(" ) ]
 
-            if found:
-                for p in ps:               
+    for sourceFile in utils.getAllSourceFiles():
+        if not sourceFile.find( "src/mongo/" ) >= 0:
+            # Skip generated sources
+            continue
 
-                    def repl( m ):
-                        m = m.groups()
+        with open(sourceFile) as f:
+            text = f.read()
 
-                        start = m[0]
-                        spaces = m[3]
-                        code = m[4]
-                        if code == '0' and replaceZero :
-                            code = getNextCode( lastCodes )
-                            lastCodes.append( code )
-                            code = str( code )
-                            needReplace[0] = True
+            if not any([zz in text for zz in quick]):
+                continue
 
-                            print( "Adding code " + code + " to line " + x + ":" + str( lineNum ) )
+            # TODO: move check for bad assert type to the linter.
+            for b in bad:
+                if b.search(text):
+                    msg = "Bare assert prohibited. Replace with [umwdf]assert"
+                    print( "%s: %s" % (sourceFile, msg) )
+                    raise Exception(msg)
 
-                        else :
-                            codes.append( ( x , lineNum , line , code ) )
-                            callback( x , lineNum , line , code )
+            splitlines = text.splitlines(True)
 
-                        return start + "(" + spaces + code
+            line_offsets = [0]
+            for line in splitlines:
+                line_offsets.append(line_offsets[-1] + len(line))
 
-                    line = re.sub( p, repl, line )
-                    # end if ps loop
-            
-            if replaceZero : lines.append( line )
-            lineNum = lineNum + 1
-        
-        if replaceZero and needReplace[0] :
-            print( "Replacing file " + x )
-            of = open( x + ".tmp", 'w' )
-            of.write( "".join( lines ) )
-            of.close()
-            os.remove(x)
-            os.rename( x + ".tmp", x )
-        
+            matchiters = [p.finditer(text) for p in patterns]
+            for matchiter in matchiters:
+                for match in matchiter:
+                    code = match.group(1)
+                    span = match.span()
 
-def getNextCode( lastCodes = [0] ):
-    highest = [max(lastCodes)]
-    def check( fileName , lineNum , line , code ):
-        code = int( code )
-        if code > highest[0]:
-            highest[0] = code
-    readErrorCodes( check )
-    return highest[0] + 1
+                    thisLoc = AssertLocation(sourceFile,
+                                             getLineForPosition(line_offsets, span[1]),
+                                             text[span[0]:span[1]],
+                                             code)
+
+                    callback( thisLoc )
+
+# Converts an absolute position in a file into a line number.
+def getLineForPosition(line_offsets, position):
+    return bisect.bisect(line_offsets, position)
+
+def isTerminated( lines ):
+    """Given .cpp/.h source lines as text, determine if assert is terminated."""
+    x = " ".join(lines)
+    return ';' in x \
+        or x.count('(') - x.count(')') <= 0
+
+
+def getNextCode():
+    """Finds next unused assertion code.
+
+    Called by: SConstruct and main()
+    Since SConstruct calls us, codes[] must be global OR WE REPARSE EVERYTHING
+    """
+    if not len(codes) > 0:
+        readErrorCodes()
+
+    highest = reduce( lambda x, y: max(int(x), int(y)),
+                      (loc.code for loc in codes) )
+    return highest + 1
+
 
 def checkErrorCodes():
+    """SConstruct expects a boolean response from this function.
+    """
+    (codes, errors) = readErrorCodes()
+    return len( errors ) == 0
+
+
+def readErrorCodes():
+    """Defines callback, calls parseSourceFiles() with callback,
+    and saves matches to global codes list.
+    """
     seen = {}
     errors = []
-    def checkDups( fileName , lineNum , line , code ):
-        if code in seen:
-            print( "DUPLICATE IDS" )
-            print( "%s:%d:%s %s" % ( fileName , lineNum , line.strip() , code ) )
-            print( "%s:%d:%s %s" % seen[code] )
-            errors.append( seen[code] )
-        seen[code] = ( fileName , lineNum , line , code )
-    readErrorCodes( checkDups, True )
-    return len( errors ) == 0 
+    dups = defaultdict(list)
 
-def getBestMessage( err , start ):
-    err = err.partition( start )[2]
+    # define callback
+    def checkDups( assertLoc ):
+        codes.append( assertLoc )
+        code = assertLoc.code
+
+        if not code in seen:
+            seen[code] = assertLoc
+        else:
+            if not code in dups:
+                # on first duplicate, add original to dups, errors
+                dups[code].append( seen[code] )
+                errors.append( seen[code] )
+
+            dups[code].append( assertLoc )
+            errors.append( assertLoc )
+
+    parseSourceFiles( checkDups )
+
+    if seen.has_key("0"):
+        code = "0"
+        bad = seen[code]
+        errors.append( bad )
+        print( "ZERO_CODE:" )
+        print( "  %s:%d:%s" % (bad.sourceFile, bad.lineNum, bad.lines) )
+
+    for code, locations in dups.items():
+        print( "DUPLICATE IDS: %s" % code )
+        for loc in locations:
+            print( "  %s:%d:%s" % (loc.sourceFile, loc.lineNum, loc.lines) )
+
+    return (codes, errors)
+
+
+def replaceBadCodes( errors, nextCode ):
+    """Modifies C++ source files to replace invalid assertion codes.
+    For now, we only modify zero codes.
+
+    Args:
+        errors: list of AssertLocation
+        nextCode: int, next non-conflicting assertion code
+    """
+    zero_errors = [e for e in errors if int(e.code) == 0]
+    skip_errors = [e for e in errors if int(e.code) != 0]
+
+    for loc in skip_errors:
+        print "SKIPPING NONZERO code=%s: %s:%s" % (loc.code, loc.sourceFile, loc.lineNum)
+
+    for assertLoc in zero_errors:
+        (sourceFile, lineNum, lines, code) = assertLoc
+        print "UPDATING_FILE: %s:%s" % (sourceFile, lineNum)
+
+        ln = lineNum - 1
+
+        with open(sourceFile, 'r+') as f:
+            fileLines = f.readlines()
+            line = fileLines[ln]
+            print "LINE_%d_BEFORE:%s" % (lineNum, line.rstrip())
+            line = re.sub(r'(\( *)(\d+)',
+                          r'\g<1>' + str(nextCode),
+                          line)
+            print "LINE_%d_AFTER :%s" % (lineNum, line.rstrip())
+            fileLines[ln] = line
+            f.seek(0)
+            f.writelines(fileLines)
+        nextCode += 1
+
+
+def getBestMessage( lines , codeStr ):
+    """Extracts message from one AssertionLocation.lines entry
+
+    Args:
+        lines: list of contiguous C++ source lines
+        codeStr: assertion code found in first line
+    """
+    line = lines if isinstance(lines, str) else " ".join(lines)
+
+    err = line.partition( codeStr )[2]
     if not err:
         return ""
-    err = err.partition( "\"" )[2]
-    if not err:
+
+    # Trim to outer quotes
+    m = re.search(r'"(.*)"', err)
+    if not m:
         return ""
-    err = err.rpartition( "\"" )[0]
-    if not err:
-        return ""
-    return err
-    
-def genErrorOutput():
-    
-    if os.path.exists( "docs/errors.md" ):
-        i = open( "docs/errors.md" , "r" )
-        
-        
-    out = open( "docs/errors.md" , 'wb' )
-    out.write( "MongoDB Error Codes\n==========\n\n\n" )
+    err = m.group(1)
 
-    prev = ""
-    seen = {}
-    
-    codes.sort( key=lambda x: x[0]+"-"+x[3] )
-    for f,l,line,num in codes:
-        if num in seen:
-            continue
-        seen[num] = True
+    # Trim inner quote pairs
+    err = re.sub(r'" +"', '', err)
+    err = re.sub(r'" *<< *"', '', err)
+    err = re.sub(r'" *<<[^<]+<< *"', '<X>', err)
+    err = re.sub(r'" *\+[^+]+\+ *"', '<X>', err)
 
-        if f.startswith( "./" ):
-            f = f[2:]
+    # Trim escaped quotes
+    err = re.sub(r'\\"', '', err)
 
-        if f != prev:
-            out.write( "\n\n" )
-            out.write( f + "\n----\n" )
-            prev = f
+    # Iff doublequote still present, trim that and any trailing text
+    err = re.sub(r'".*$', '', err)
 
-        url = "http://github.com/mongodb/mongo/blob/master/" + f + "#L" + str(l)
-        
-        out.write( "* " + str(num) + " [code](" + url + ") " + getBestMessage( line , str(num) ) + "\n" )
-        
-    out.write( "\n" )
-    out.close()
+    return err.strip()
+
+def main():
+    parser = OptionParser(description=__doc__.strip())
+    parser.add_option("--fix", dest="replace",
+                      action="store_true", default=False,
+                      help="Fix zero codes in source files [default: %default]")
+    (options, args) = parser.parse_args()
+
+    (codes, errors) = readErrorCodes()
+    ok = len(errors) == 0
+    next = getNextCode()
+
+    print("ok: %s" % ok)
+    print("next: %s" % next)
+
+    if ok:
+        sys.exit(0)
+    elif options.replace:
+        replaceBadCodes(errors, next)
+    else:
+        print ERROR_HELP
+        sys.exit(1)
+
+
+ERROR_HELP = """
+ERRORS DETECTED. To correct, run "buildscripts/errorcodes.py --fix" to replace zero codes.
+Other errors require manual correction.
+"""
 
 if __name__ == "__main__":
-    ok = checkErrorCodes()
-    print( "ok:" + str( ok ) )
-    print( "next: " + str( getNextCode() ) )
-    if ok:
-        genErrorOutput()
-
+    main()

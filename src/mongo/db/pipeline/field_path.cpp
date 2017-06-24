@@ -12,76 +12,72 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * As a special exception, the copyright holders give permission to link the
+ * code of portions of this program with the OpenSSL library under certain
+ * conditions as described in each individual source file and distribute
+ * linked combinations including the program with the OpenSSL library. You
+ * must comply with the GNU Affero General Public License in all respects for
+ * all of the code used other than as permitted herein. If you modify file(s)
+ * with this exception, you may extend this exception to your version of the
+ * file(s), but you are not obligated to do so. If you do not wish to do so,
+ * delete this exception statement from your version. If you delete this
+ * exception statement from all source files in the program, then also delete
+ * it in the license file.
  */
 
-#include "pch.h"
-#include "db/pipeline/field_path.h"
-#include "util/mongoutils/str.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/db/pipeline/field_path.h"
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bson_depth.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-    using namespace mongoutils;
 
-    FieldPath::~FieldPath() {
+using std::string;
+using std::vector;
+
+string FieldPath::getFullyQualifiedPath(StringData prefix, StringData suffix) {
+    if (prefix.empty()) {
+        return suffix.toString();
     }
 
-    FieldPath::FieldPath():
-        vFieldName() {
+    return str::stream() << prefix << "." << suffix;
+}
+
+FieldPath::FieldPath(std::string inputPath)
+    : _fieldPath(std::move(inputPath)), _fieldPathDotPosition{string::npos} {
+    uassert(40352, "FieldPath cannot be constructed with empty string", !_fieldPath.empty());
+    uassert(40353, "FieldPath must not end with a '.'.", _fieldPath[_fieldPath.size() - 1] != '.');
+
+    // Store index delimiter position for use in field lookup.
+    size_t dotPos;
+    size_t startPos = 0;
+    while (string::npos != (dotPos = _fieldPath.find('.', startPos))) {
+        _fieldPathDotPosition.push_back(dotPos);
+        startPos = dotPos + 1;
     }
 
-    FieldPath::FieldPath(const string &fieldPath):
-        vFieldName() {
-        /*
-          The field path could be using dot notation.
-          Break the field path up by peeling off successive pieces.
-        */
-        size_t startpos = 0;
-        while(true) {
-            /* find the next dot */
-            const size_t dotpos = fieldPath.find('.', startpos);
+    _fieldPathDotPosition.push_back(_fieldPath.size());
 
-            /* if there are no more dots, use the remainder of the string */
-            if (dotpos == fieldPath.npos) {
-                vFieldName.push_back(fieldPath.substr(startpos, dotpos));
-                break;
-            }
-
-            /* use the string up to the dot */
-            const size_t length = dotpos - startpos;
-            uassert(15998, str::stream() <<
-                    "field names cannot be zero length (in path \"" <<
-                    fieldPath << "\")",
-                    length > 0);
-
-            vFieldName.push_back(fieldPath.substr(startpos, length));
-
-            /* next time, search starting one spot after that */
-            startpos = dotpos + 1;
-        }
+    // Validate the path length and the fields.
+    const auto pathLength = getPathLength();
+    uassert(ErrorCodes::Overflow,
+            "FieldPath is too long",
+            pathLength <= BSONDepth::getMaxAllowableDepth());
+    for (size_t i = 0; i < pathLength; ++i) {
+        uassertValidFieldName(getFieldName(i));
     }
+}
 
-    string FieldPath::getPath(bool fieldPrefix) const {
-        stringstream ss;
-        writePath(ss, fieldPrefix);
-        return ss.str();
-    }
-
-    void FieldPath::writePath(ostream &outStream, bool fieldPrefix) const {
-        if (fieldPrefix)
-            outStream << "$";
-
-        outStream << vFieldName[0];
-
-        const size_t n = vFieldName.size();
-        for(size_t i = 1; i < n; ++i)
-            outStream << "." << vFieldName[i];
-    }
-
-    FieldPath &FieldPath::operator=(const FieldPath &rRHS) {
-        if (this != &rRHS) {
-            vFieldName = rRHS.vFieldName;
-        }
-
-        return *this;
-    }
-
+void FieldPath::uassertValidFieldName(StringData fieldName) {
+    uassert(15998, "FieldPath field names may not be empty strings.", !fieldName.empty());
+    uassert(16410, "FieldPath field names may not start with '$'.", fieldName[0] != '$');
+    uassert(
+        16411, "FieldPath field names may not contain '\0'.", fieldName.find('\0') == string::npos);
+    uassert(
+        16412, "FieldPath field names may not contain '.'.", fieldName.find('.') == string::npos);
+}
 }
